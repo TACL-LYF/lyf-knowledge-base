@@ -4,7 +4,7 @@ Collects feedback from a Discord channel and a set of Google Drive folders and p
 
 The full design and milestones are in [docs/PLAN.md](docs/PLAN.md).
 
-> **Status:** M1 (raw pulls). `kb pull` reads everything from Discord and Drive into `data/raw/`; the other `kb` commands described below arrive in milestones M2–M4. The setup steps in this README (Discord bot, Google Cloud service account, folder access) can be done now.
+> **Status:** M2 (state and incremental runs). `kb update` reads only what's new since the last run and saves it, with state shared in Drive; `kb status` shows where things stand. Extraction and the Consolidated Feedback doc arrive in M3–M4.
 
 ## Contents
 
@@ -132,7 +132,7 @@ The pipeline works with **two kinds of Drive folder**: one or more source folder
 ### Source folders: read-only
 
 - **What they are:** the existing Drive folders that hold the feedback Docs, Sheets, and Slides. List as many as you need.
-- **What's read:** only the files directly inside each folder. Subfolders are skipped for now; reading them is planned for a later milestone. To include a subfolder today, add its ID as another source folder.
+- **What's read:** every Doc, Sheet, and Slides file inside each folder, including files in its subfolders.
 - **Access:** share each folder with the service account as **Viewer**. Sharing a folder also gives access to everything inside it, including files added later.
 - **What the pipeline does here:** lists files and exports their text. It **never** edits, moves, or deletes anything in these folders. Viewer access guarantees that, even if the code has a bug.
 - **How to share:** in Drive, right-click each folder → **Share** → paste the service account email → choose **Viewer** → turn off **Notify people** (the address can't receive mail) → **Share**.
@@ -219,7 +219,7 @@ The pipeline keeps local copies of everything it fetches in `data/`, so you can 
 
 ```
 data/
-├── raw/discord/    # fetched messages, per run
+├── raw/discord/    # fetched messages, per run (+ members.json, cached nicknames)
 ├── raw/drive/      # exported text of Drive files
 └── state/          # local copy of the _state/ folder from Drive
 ```
@@ -247,18 +247,26 @@ data/raw/
 └── pull_summary.json                  counts, every item with its link, and any export errors
 ```
 
-Bot and system messages are left out. Docs are exported as markdown, Slides as slide text plus speaker notes, and Sheets as one table per tab. Only the direct children of each source folder are read for now (subfolders arrive in M2), so list the folders that actually hold the files in `drive.source_folder_ids`. Archived **private** threads are skipped unless the bot has the Manage Threads permission.
+Bot and system messages are left out. Docs are exported as markdown, Slides as slide text plus speaker notes, and Sheets as one table per tab. Source folders are read recursively. Archived **private** threads are skipped unless the bot has the Manage Threads permission.
+
+Looking up each author's server nickname takes one Discord API call per person, so nicknames are remembered in `data/raw/discord/members.json` and only new authors are looked up. Use `kb pull --refresh-names` after people change their nicknames.
 
 ### Full pipeline
 
-_(Available from M2 onward.)_
-
 ```bash
-kb update             # normal run: new Discord messages + new/changed Drive files → rebuild the doc
-kb update --dry-run   # show what would change, without calling the LLM or writing anything
-kb status             # last run, item counts, errors, programming types found
-kb update --full      # rare: read the whole Discord channel again (only for a full reload)
-kb rebuild            # rare: extract everything again (e.g., after a big prompt change)
+kb update             # normal run: new Discord messages + new/changed Drive files
+kb update --dry-run   # show what's new, without saving anything (no lock, no Drive writes)
+kb status             # last run, lock, cursors, item counts, errors, programming types
+kb update --full      # rare: read the whole Discord channel again to find edited/deleted messages
+kb rebuild            # rare: extract everything again (M3)
 ```
 
-The first `kb update` reads everything, because there's no saved state yet. After that, each run only reads what's new.
+The first `kb update` reads everything, because there's no saved state yet. After that, each run only reads what's new:
+
+- **Discord:** messages after the last one read in the channel and in each thread. When an old thread gets new messages, only those are new; the earlier ones are kept as context.
+- **Drive:** files not seen before (including old files moved into a source folder), and files modified since the last run started. If a modified file's text is the same (for example, only a comment was added), it's skipped.
+- **Removed Drive files** are marked `removed` in the manifest.
+
+As of M2, a run saves the new content to `raw/` in the Knowledge Base folder (`raw/discord/YYYY-MM-DD.json`, `raw/drive/<fileId>.md`, plus local copies in `data/raw/`) and updates `_state/`. Extraction (M3) and the doc (M4) will plug into the same run.
+
+**If a run fails,** nothing in `_state/` changes and the next run starts from the same place. If a run is killed hard (e.g. the laptop closes), its lock stays behind; after `state.lock_timeout_minutes` (default 60) it counts as stale and `kb update --force-unlock` clears it.

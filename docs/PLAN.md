@@ -133,7 +133,7 @@ At the start of a run, the script takes the lock and downloads `_state/` into `d
 
 ### Local copies
 
-Everything fetched is also saved locally in `data/` (`data/raw/discord/`, `data/raw/drive/`, `data/state/`) for inspection and debugging. `data/` is in `.gitignore` and never committed. Drive is the source of truth for state, so the local copy is only a cache and can be deleted at any time.
+Everything fetched is also saved locally in `data/` (`data/raw/discord/`, `data/raw/drive/`, `data/state/`) for inspection and debugging. `data/raw/discord/members.json` caches the server nickname of every Discord author already looked up (user ID → username, nickname, display name), so each run only looks up new authors; it's local only. `data/` is in `.gitignore` and never committed. Drive is the source of truth for state, so the local copy is only a cache and can be deleted at any time.
 
 ### Cursors
 
@@ -222,6 +222,7 @@ lyf-knowledge-base/
 │   │   ├── discord.py   # channel + threads, read after cursors
 │   │   └── drive.py     # list files, compare to manifest, export Docs/Sheets/Slides
 │   ├── pull.py          # M1: full read of both sources into data/raw/
+│   ├── update.py        # one `kb update` run: lock, read what's new, save raw + state
 │   ├── extract.py       # item → feedback records + citations
 │   ├── synthesize.py    # records → programming types/themes → markdown
 │   └── publish.py       # update doc and Citations sheet, upload raw files
@@ -291,15 +292,16 @@ Each milestone ends with something you can demo, and doesn't depend on later mil
 
 ### M2: State and incremental runs
 
-- [ ] `state.py`: download and upload `_state/` to Drive, and the lock with stale-lock handling
-- [ ] Discord cursors (main channel and per thread), saved only after a successful run
-- [ ] Drive comparison: new / changed / skip / removed, based on the manifest and the last run's start time
-- [ ] Content hashing, so changes that don't affect the text are skipped
-- [ ] Recursive Drive listing: read subfolders of each source folder too
-- [ ] `kb update --full` for edited and deleted Discord messages
-- [ ] Upload raw snapshots to `raw/` in Drive
-- [ ] `kb update --dry-run` and `kb status`
-- [ ] Tests: new channel message, new message in an old thread, new thread, new Drive file, old file moved into the folder, edited file, comment-only change, removed file, and a crash before state is saved
+- [x] `state.py`: download and upload `_state/` to Drive, and the lock with stale-lock handling
+- [x] Discord cursors (main channel and per thread), saved only after a successful run
+- [x] Drive comparison: new / changed / skip / removed, based on the manifest and the last run's start time
+- [x] Content hashing, so changes that don't affect the text are skipped
+- [x] Recursive Drive listing: read subfolders of each source folder too
+- [x] `kb update --full` for edited and deleted Discord messages
+- [x] Upload raw snapshots to `raw/` in Drive
+- [x] `kb update --dry-run` and `kb status`
+- [x] Tests: new channel message, new message in an old thread, new thread, new Drive file, old file moved into the folder, edited file, comment-only change, removed file, and a crash before state is saved
+- [x] Local cache of Discord server nicknames already looked up (`data/raw/discord/members.json`), so only new authors are looked up; `--full` and `kb pull --refresh-names` look everyone up again
 
 **Done when:** a second run right after the first finds 0 new items; posting one Discord message, editing one Doc, and moving an old file into the folder makes exactly those three show up; and `--full` reports a deleted test message.
 

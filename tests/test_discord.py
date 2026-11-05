@@ -222,3 +222,32 @@ def test_fetch_member_names_skips_bots_and_departed_members():
         names = fetch_member_names(c, SERVER, messages)
     assert names == {"u-alice": "Nick u-alice", "u-carol": "Nick u-carol", "u-dave": "Nick u-dave"}
     assert sorted(requested) == ["u-alice", "u-carol", "u-dave", "u-gone", "u-nonick"]
+
+
+def test_member_cache_remembers_members_without_a_nickname(tmp_path):
+    from kb.sources.discord import MemberCache
+
+    requested = []
+
+    def handler(request):
+        uid = request.url.path.rsplit("/", 1)[-1]
+        requested.append(uid)
+        if uid == "u-gone":
+            return httpx.Response(404, json={"message": "Unknown Member"})
+        return httpx.Response(200, json={"nick": "Ali" if uid == "u-alice" else None})
+
+    messages = [msg(1, author="alice"), msg(2, author="gone"), msg(3, author="bob")]
+    path = tmp_path / "members.json"
+    with client_for(handler) as c:
+        names = fetch_member_names(c, SERVER, messages, cache=MemberCache(path))
+        assert names == {"u-alice": "Ali"}
+        # A fresh cache loaded from disk: nobody is looked up again.
+        names = fetch_member_names(c, SERVER, messages, cache=MemberCache(path))
+        assert names == {"u-alice": "Ali"}
+        assert len(requested) == 3
+        # refresh looks everyone up again
+        fetch_member_names(c, SERVER, messages, cache=MemberCache(path), refresh=True)
+        assert len(requested) == 6
+    cache = MemberCache(path)
+    assert cache.entries["u-bob"]["nick"] is None
+    assert cache.entries["u-bob"]["display_name"] == "bob"

@@ -8,8 +8,13 @@ Local only and a full read every time; nothing is written to Discord or Drive.
     ├── drive/<fileId>.md                  exported text, with metadata front matter
     └── pull_summary.json                  counts, every item with its link, errors
 
+Server nicknames already looked up are remembered in data/raw/discord/members.json
+(shared with `kb update`), so only new authors are looked up. `--refresh-names` looks
+everyone up again.
+
 Each source is written to a temporary directory first and swapped in only when it
-finishes, so a failed pull leaves the previous output in place.
+finishes, so a failed pull leaves the previous output in place. Only the pull's own
+subdirectories are replaced; `kb update`'s dated snapshots in discord/ are left alone.
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ from kb.sources import drive as gdrive
 
 Log = Callable[[str], None]
 SOURCES = ("discord", "drive")
+MEMBER_CACHE = Path("raw") / "discord" / "members.json"  # relative to data_dir
 
 
 def _now() -> str:
@@ -51,9 +57,19 @@ def _write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def pull_discord(cfg: Config, raw_dir: Path, log: Log) -> dict[str, Any]:
+def pull_discord(
+    cfg: Config, raw_dir: Path, log: Log, refresh_names: bool = False
+) -> dict[str, Any]:
+    cache = dsc.MemberCache(cfg.data_dir / MEMBER_CACHE)
     with dsc.DiscordClient(cfg.discord_bot_token) as client:
-        pull = dsc.fetch_all(client, cfg.discord_server_id, cfg.discord_channel_id, log)
+        pull = dsc.fetch_all(
+            client,
+            cfg.discord_server_id,
+            cfg.discord_channel_id,
+            log,
+            member_cache=cache,
+            refresh_names=refresh_names,
+        )
     items = dsc.build_items(pull)
 
     partial = _fresh_dir(raw_dir / ".discord.partial")
@@ -74,7 +90,11 @@ def pull_discord(cfg: Config, raw_dir: Path, log: Log) -> dict[str, Any]:
                 "path": rel.as_posix(),
             }
         )
-    _swap_in(partial, raw_dir / "discord")
+    (raw_dir / "discord").mkdir(parents=True, exist_ok=True)
+    for sub in ("threads", "messages"):
+        (partial / sub).mkdir(exist_ok=True)
+        _swap_in(partial / sub, raw_dir / "discord" / sub)
+    partial.rmdir()
 
     threads = sum(1 for i in items if i["kind"] == "thread")
     for w in pull.warnings:
@@ -130,7 +150,12 @@ def pull_drive(
     return {"files": len(listed), "by_type": by_type, "items": listed, "errors": errors}
 
 
-def pull(cfg: Config, sources: tuple[str, ...] = SOURCES, log: Log = print) -> dict[str, Any]:
+def pull(
+    cfg: Config,
+    sources: tuple[str, ...] = SOURCES,
+    log: Log = print,
+    refresh_names: bool = False,
+) -> dict[str, Any]:
     """Pull the given sources into data/raw/ and write pull_summary.json."""
     raw_dir = cfg.data_dir / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -144,7 +169,7 @@ def pull(cfg: Config, sources: tuple[str, ...] = SOURCES, log: Log = print) -> d
 
     summary["started_at"] = _now()
     if "discord" in sources:
-        summary["discord"] = pull_discord(cfg, raw_dir, log)
+        summary["discord"] = pull_discord(cfg, raw_dir, log, refresh_names)
     if "drive" in sources:
         summary["drive"] = pull_drive(cfg, raw_dir, log)
     summary["finished_at"] = _now()
