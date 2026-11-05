@@ -885,6 +885,7 @@ def run_update(
             names = st.download(state_folder, local_state)
             state = st.State(local_state).load()
             store = load_store(local_state)
+            store.citations.apply_author_rule()
             last = state.run_log[-1] if state.run_log else None
             if not names:
                 s.result = "no saved state yet: this run reads everything"

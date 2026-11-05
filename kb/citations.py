@@ -17,6 +17,28 @@ from pathlib import Path
 from typing import Any
 
 EXCERPT_CHARS = 300
+UNKNOWN_AUTHOR = "unknown"
+
+# Titles of Drive files that usually collect several people's words (debriefs, surveys,
+# form responses, meeting or brainstorm notes): the file's owner didn't write it all.
+COLLECTED = re.compile(
+    r"\b(feedback|surveys?|debriefs?|responses?|forms?|retros?|retrospectives?|"
+    r"evaluations?|evals?|compiled|consolidated|recaps?|summar(y|ies)|notes|"
+    r"brainstorm\w*|meetings?|minutes|kickoff)\b",
+    re.IGNORECASE,
+)
+
+
+def drive_author(owner: str | None, title: str | None, owner_is_editor: bool = False) -> str:
+    """Who to credit for a Drive file: its owner, unless that's a guess.
+
+    "unknown" when no owner is known (a Shared Drive file, where `owner` is only the
+    last person to edit it), or when the title suggests the file collects other
+    people's feedback or notes. The owner is still kept in the citation's `owner`.
+    """
+    if not owner or owner_is_editor or COLLECTED.search(title or ""):
+        return UNKNOWN_AUTHOR
+    return owner
 
 
 def discord_key(message_id: str) -> str:
@@ -98,7 +120,11 @@ class Citations:
             "item_id": entry["id"],
             "source": entry.get("source"),
             "link": entry.get("link"),
-            "author": entry.get("owner"),
+            "author": drive_author(
+                entry.get("owner"), entry.get("title"), bool(entry.get("owner_is_editor"))
+            ),
+            "owner": entry.get("owner"),
+            "owner_is_editor": bool(entry.get("owner_is_editor")),
             "date": normalize_time(entry.get("modified_time")),
             "context": entry.get("title"),
             "excerpt": None,
@@ -127,10 +153,31 @@ class Citations:
             row.update(
                 {
                     "link": entry.get("link"),
-                    "author": entry.get("owner"),
+                    "author": drive_author(
+                        entry.get("owner"), entry.get("title"), bool(entry.get("owner_is_editor"))
+                    ),
+                    "owner": entry.get("owner"),
+                    "owner_is_editor": bool(entry.get("owner_is_editor")),
                     "context": entry.get("title"),
                 }
             )
+
+    def apply_author_rule(self) -> int:
+        """Re-credit saved Drive citations with `drive_author`, from what they record
+        (citations saved before the rule existed credit the owner). Returns how many
+        changed."""
+        n = 0
+        for row in self.rows:
+            if row.get("source") == "discord":
+                continue
+            owner = row["owner"] if "owner" in row else row.get("author")
+            if owner == UNKNOWN_AUTHOR:
+                owner = None
+            author = drive_author(owner, row.get("context"), bool(row.get("owner_is_editor")))
+            if row.get("author") != author or row.get("owner") != owner:
+                n += row.get("author") != author
+                row["author"], row["owner"] = author, owner
+        return n
 
     def get(self, citation_id: str) -> dict[str, Any] | None:
         return self.by_id.get(citation_id)

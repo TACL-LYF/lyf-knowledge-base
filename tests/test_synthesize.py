@@ -601,7 +601,7 @@ def test_publish_creates_the_files_once_and_updates_them_in_place():
 
     tabs = fake.by_name("Citations")["tabs"]
     assert tabs["Citations"][0][0] == "ID" and len(tabs["Citations"]) == 6
-    assert isinstance(tabs["Citations"][1][7], render.Link)
+    assert isinstance(tabs["Citations"][1][8], render.Link)
     assert [row[6] for row in tabs["Records"][1:]] == ["2023", "2023", "2024", "2024", "2024"]
 
     before = dict(saved.docs)
