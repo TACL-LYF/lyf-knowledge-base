@@ -293,6 +293,9 @@ def fetch(
             if t["id"] not in thread_cursors
             or _newer(t.get("last_message_id"), thread_cursors[t["id"]])
         ]
+        log(f"threads: {len(threads)} found, {len(ordered)} with new messages to read")
+    else:
+        log(f"threads: {len(threads)} found (active and archived), reading all")
     thread_messages: dict[str, list[dict[str, Any]]] = {}
     unreadable: set[str] = set()
     for i, t in enumerate(ordered, 1):
@@ -302,10 +305,8 @@ def fetch(
             warnings.append(f"Thread '{t.get('name')}' ({t['id']}) was skipped: {e}")
             unreadable.add(t["id"])
             continue
-        if i % 25 == 0 or i == len(ordered):
-            log(f"threads: {i}/{len(ordered)} {'read' if full else 'with new messages read'}")
-    if not full and not ordered:
-        log("threads: none with new messages")
+        if i % 10 == 0 or i == len(ordered):
+            log(f"threads: {i}/{len(ordered)} read")
 
     for tid, msgs in thread_messages.items():
         latest = _max_id(msgs, thread_cursors.get(tid))
@@ -314,9 +315,8 @@ def fetch(
 
     all_fetched = channel_messages + [m for msgs in thread_messages.values() for m in msgs]
     member_names = fetch_member_names(
-        client, server_id, all_fetched, cache=member_cache, refresh=refresh_names
+        client, server_id, all_fetched, cache=member_cache, refresh=refresh_names, log=log
     )
-    log(f"server nicknames: {len(member_names)} found")
 
     return DiscordPull(
         server_id=server_id,
@@ -388,6 +388,7 @@ def fetch_member_names(
     *,
     cache: MemberCache | None = None,
     refresh: bool = False,
+    log: Callable[[str], None] = lambda _: None,
 ) -> dict[str, str]:
     """Server nicknames for every human author, including authors of replied-to messages.
 
@@ -401,10 +402,21 @@ def fetch_member_names(
             if author.get("id") and not author.get("bot"):
                 authors[author["id"]] = author
     names: dict[str, str] = {}
+    to_look_up = [u for u in authors if cache is None or refresh or u not in cache]
+    if to_look_up:
+        cached = len(authors) - len(to_look_up)
+        log(
+            f"server nicknames: looking up {len(to_look_up)} of {len(authors)} authors"
+            + (f" ({cached} already cached)" if cached else "")
+        )
+    looked_up = 0
     for uid in sorted(authors):
         if cache is not None and uid in cache and not refresh:
             nick = cache.nick(uid)
         else:
+            looked_up += 1
+            if looked_up % 25 == 0:
+                log(f"server nicknames: {looked_up}/{len(to_look_up)} looked up")
             member = client.get_member(server_id, uid)
             nick = (member or {}).get("nick") or None
             if cache is not None:
@@ -413,6 +425,8 @@ def fetch_member_names(
             names[uid] = nick
     if cache is not None:
         cache.save()
+    how = f"{len(to_look_up)} looked up" if to_look_up else "all from the local cache"
+    log(f"server nicknames: {len(names)} of {len(authors)} authors have one ({how})")
     return names
 
 

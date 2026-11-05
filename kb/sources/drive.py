@@ -10,7 +10,7 @@ Exporters (each returns markdown):
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -93,13 +93,16 @@ def list_children(
 
 
 def list_folder_files(
-    drive: Any, folder_ids: Iterable[str], mime_types: Iterable[str] | None = None
+    drive: Any,
+    folder_ids: Iterable[str],
+    mime_types: Iterable[str] | None = None,
+    log: Callable[[str], None] = lambda _: None,
 ) -> Iterator[dict[str, Any]]:
     """Every file inside any of the folders, including files in their subfolders.
 
     A file reachable from more than one folder is returned once, and a folder reached
     twice is only read once. If mime_types is given, only files of those types are
-    returned.
+    returned. Progress (folders read, files found) is logged every 10 folders.
     """
     wanted = set(mime_types) if mime_types is not None else None
     seen_files: set[str] = set()
@@ -126,6 +129,11 @@ def list_folder_files(
             token = page.get("nextPageToken")
             if not token:
                 break
+        if len(seen_folders) % 10 == 0 or not queue:
+            log(
+                f"folders read: {len(seen_folders)} ({len(queue)} queued), "
+                f"in-scope files found: {len(seen_files)}"
+            )
 
 
 def get_file(drive: Any, file_id: str, fields: str = FILE_FIELDS) -> dict[str, Any]:

@@ -63,10 +63,10 @@ def test_failed_pull_leaves_previous_output(tmp_path, monkeypatch):
 
 
 def test_pull_summary_keeps_other_source_on_partial_pull(tmp_path, monkeypatch):
-    monkeypatch.setattr(pull, "pull_drive", lambda *a: {"files": 2})
-    monkeypatch.setattr(pull, "pull_discord", lambda *a: {"threads": 1})
+    monkeypatch.setattr(pull, "pull_drive", lambda *a, **kw: {"files": 2})
+    monkeypatch.setattr(pull, "pull_discord", lambda *a, **kw: {"threads": 1})
     pull.pull(cfg(tmp_path), ("discord", "drive"), log=lambda _: None)
-    monkeypatch.setattr(pull, "pull_discord", lambda *a: {"threads": 5})
+    monkeypatch.setattr(pull, "pull_discord", lambda *a, **kw: {"threads": 5})
     pull.pull(cfg(tmp_path), ("discord",), log=lambda _: None)
 
     summary = json.loads((tmp_path / "raw" / "pull_summary.json").read_text())

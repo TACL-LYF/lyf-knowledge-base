@@ -27,6 +27,7 @@ from typing import Any
 
 from kb import state as st
 from kb.config import Config
+from kb.progress import Stages
 from kb.pull import MEMBER_CACHE
 from kb.sources import discord as dsc
 from kb.sources import drive as gdrive
@@ -74,7 +75,7 @@ class Sources:
             discord_fetch=discord_fetch,
             drive_list=lambda: list(
                 gdrive.list_folder_files(
-                    services.drive, cfg.drive_source_folder_ids, cfg.drive_file_types
+                    services.drive, cfg.drive_source_folder_ids, cfg.drive_file_types, log
                 )
             ),
             drive_export=lambda f: gdrive.export_text(services, f),
@@ -248,12 +249,14 @@ def export_drive(
 ) -> None:
     todo = changes.new + changes.modified
     modified_ids = {f["id"] for f in changes.modified}
+    width = len(str(len(todo)))
     for n, f in enumerate(todo, 1):
+        label = f"({n:>{width}}/{len(todo)}) {f.get('name') or f['id']}"
         try:
             body = export(f)
         except Exception as e:  # one bad file shouldn't stop the run
             changes.errors[f["id"]] = f"{type(e).__name__}: {e}"
-            log(f"  error exporting '{f.get('name')}': {changes.errors[f['id']]}")
+            log(f"{label}: error: {changes.errors[f['id']]}")
         else:
             changes.exported[f["id"]] = body
             if f["id"] in modified_ids:
@@ -262,8 +265,9 @@ def export_drive(
                     body
                 )
                 (changes.unchanged if same else changes.changed).append(f)
-        if n % 25 == 0 or n == len(todo):
-            log(f"  exported {n}/{len(todo)}")
+                log(f"{label}: {'same text, skipped' if same else 'changed'}")
+            else:
+                log(f"{label}: new")
 
 
 def apply_drive(state: st.State, changes: DriveChanges, now: str) -> None:
@@ -303,8 +307,10 @@ def save_raw(
     discord: DiscordChanges,
     drive: DriveChanges,
     files_by_id: dict[str, dict[str, Any]],
-) -> None:
+) -> str:
     """Write this run's new content to data/raw/ (local only; nothing is uploaded).
+
+    Returns a one-line summary of what was written.
 
     Discord: one file per day, `discord/YYYY-MM-DD.json`, holding every run that day.
     Drive: `drive/<fileId>.md`, the latest export of each new or changed file.
@@ -338,6 +344,13 @@ def save_raw(
             text = gdrive.render_file(files_by_id[fid], drive.exported[fid])
             (raw_dir / "drive" / f"{fid}.md").write_text(text, encoding="utf-8")
 
+    parts = []
+    if discord.items or discord.deleted:
+        parts.append(f"discord/{local.name} ({_plural(len(discord.items), 'item')})")
+    if to_write:
+        parts.append(f"drive/ ({_plural(len(to_write), 'file')})")
+    return f"wrote {' and '.join(parts)} in {raw_dir}" if parts else "nothing new to write"
+
 
 # ---------------------------------------------------------------------------
 # The run
@@ -352,6 +365,24 @@ class RunResult:
     dry_run: bool
 
 
+def _plural(n: int, word: str, plural: str | None = None) -> str:
+    return f"{n} {word if n == 1 else (plural or word + 's')}"
+
+
+def discord_result(d: DiscordChanges, full: bool) -> str:
+    threads_new = sum(1 for i in d.items if i["kind"] == "thread" and not i["context"])
+    threads_more = sum(1 for i in d.items if i["kind"] == "thread" and i["context"])
+    channel = sum(1 for i in d.items if i["kind"] == "message")
+    out = (
+        f"{_plural(d.new_messages, 'new message')} in {_plural(len(d.items), 'item')} "
+        f"({_plural(threads_new, 'new thread')}, {threads_more} older threads with new "
+        f"messages, {_plural(channel, 'channel message')})"
+    )
+    if full:
+        out += f"; {len(d.edited)} edited, {len(d.deleted)} deleted"
+    return out
+
+
 def run_update(
     cfg: Config,
     *,
@@ -362,17 +393,37 @@ def run_update(
     sources: Sources | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> RunResult:
-    sources = sources or Sources.real(cfg, log)
+    stages = Stages(log, total=8 if sources is None else 7)
+    mode = " (dry run: nothing will be saved)" if dry_run else ""
+    log(f"kb update{' --full' if full else ''}{mode}")
+
+    if sources is None:
+        with stages.stage("Connecting to Google Drive") as s:
+            sources = Sources.real(cfg, stages.detail)
+            s.result = f"signed in as {gdrive.service_account_email(cfg.google_credentials_path)}"
+
     # A dry run writes nothing to Drive, not even an empty _state/ folder on a first run.
     state_folder = sources.kb_folder.subfolder(st.STATE_FOLDER, create=not dry_run)
     local_state = cfg.data_dir / "state"
 
     lock = st.Lock(state_folder or st.MemoryFolder(), cfg.lock_timeout_minutes, clock=clock)
-    if not dry_run:
-        lock.acquire(force_unlock=force_unlock)
+    if dry_run:
+        stages.skip("Taking the run lock", "dry run")
+    else:
+        with stages.stage("Taking the run lock") as s:
+            lock.acquire(force_unlock=force_unlock)
+            s.result = f"lock taken by {lock.holder} (run {lock.run_id})"
     try:
-        st.download(state_folder, local_state)
-        state = st.State(local_state).load()
+        with stages.stage("Downloading state from Drive") as s:
+            names = st.download(state_folder, local_state)
+            state = st.State(local_state).load()
+            last = state.run_log[-1] if state.run_log else None
+            if not names:
+                s.result = "no saved state yet: this run reads everything"
+            else:
+                s.result = f"{_plural(len(names), 'file')}, {len(state.manifest)} items known"
+                if last:
+                    s.result += f"; last run {last.get('started_at')} by {last.get('who')}"
         started_at = clock().strftime("%Y-%m-%dT%H:%M:%SZ") if clock else st.now_iso()
         run = {
             "run_id": lock.run_id,
@@ -383,45 +434,79 @@ def run_update(
         }
 
         first = state.cursors.get("last_run_started_at") is None
-        if first and not full:
-            log("No previous run found: reading everything.")
-        pull = sources.discord_fetch(None if (full or first) else state.cursors, full)
-        discord = plan_discord(pull, state.manifest)
+        how = (
+            "everything (--full)"
+            if full
+            else "everything (first run)"
+            if first
+            else "messages after the saved cursors"
+        )
+        with stages.stage(f"Reading Discord: {how}") as s:
+            pull = sources.discord_fetch(None if (full or first) else state.cursors, full)
+            discord = plan_discord(pull, state.manifest)
+            for w in pull.warnings:
+                s.detail(f"warning: {w}")
+            s.result = discord_result(discord, full)
 
-        files = sources.drive_list()
-        log(f"Drive: {len(files)} in-scope files listed")
-        drive = classify_drive(files, state.manifest, state.cursors.get("last_run_started_at"))
-        if not dry_run:
-            export_drive(drive, state.manifest, sources.drive_export, log)
+        with stages.stage("Listing Drive files and comparing to the manifest") as s:
+            files = sources.drive_list()
+            drive = classify_drive(files, state.manifest, state.cursors.get("last_run_started_at"))
+            s.result = (
+                f"{_plural(len(files), 'file')}: {len(drive.new)} new, "
+                f"{len(drive.modified)} modified since the last run, "
+                f"{len(drive.skipped)} unchanged, {len(drive.removed)} removed"
+            )
+
+        todo = len(drive.new) + len(drive.modified)
+        if dry_run:
+            stages.skip("Exporting new and modified Drive files", "dry run")
+        elif not todo:
+            stages.skip("Exporting new and modified Drive files", "nothing to export")
+        else:
+            with stages.stage(f"Exporting {_plural(todo, 'new or modified Drive file')}") as s:
+                export_drive(drive, state.manifest, sources.drive_export, s.detail)
+                s.result = (
+                    f"{len(drive.new)} new, {len(drive.changed)} changed, "
+                    f"{len(drive.unchanged)} with the same text (skipped), "
+                    f"{_plural(len(drive.errors), 'error')}"
+                )
 
         result = RunResult(run=run, discord=discord, drive=drive, dry_run=dry_run)
         if dry_run:
+            stages.skip("Saving raw snapshots", "dry run")
+            stages.skip("Saving state to Drive", "dry run")
             return result
 
-        save_raw(cfg, run, discord, drive, {f["id"]: f for f in files})
+        with stages.stage("Saving raw snapshots locally") as s:
+            s.result = save_raw(cfg, run, discord, drive, {f["id"]: f for f in files})
 
         # (M3: extraction goes here. M4: synthesis and publish.)
 
-        cursors_before = dict(state.cursors)
-        apply_discord(state, pull, discord, started_at)
-        apply_drive(state, drive, started_at)
-        state.cursors["last_run_started_at"] = started_at
-        run.update(
-            {
-                "finished_at": st.now_iso(),
-                "discord_channel_cursor": {
-                    "before": cursors_before.get("discord_channel"),
-                    "after": state.cursors["discord_channel"],
-                },
-                "summary": summarize(result),
-            }
-        )
-        state.run_log.append(run)
-        state.save()
-        st.upload(state_folder, local_state)
+        with stages.stage("Saving state to Drive") as s:
+            cursors_before = dict(state.cursors)
+            apply_discord(state, pull, discord, started_at)
+            apply_drive(state, drive, started_at)
+            state.cursors["last_run_started_at"] = started_at
+            run.update(
+                {
+                    "finished_at": st.now_iso(),
+                    "discord_channel_cursor": {
+                        "before": cursors_before.get("discord_channel"),
+                        "after": state.cursors["discord_channel"],
+                    },
+                    "summary": summarize(result),
+                }
+            )
+            state.run_log.append(run)
+            state.save()
+            uploaded = st.upload(state_folder, local_state)
+            s.result = f"uploaded {', '.join(uploaded)}"
         return result
     finally:
-        lock.release()
+        if lock.file_id is not None:
+            lock.release()
+            log("Run lock released.")
+        log(f"Finished in {stages.elapsed():.1f}s.")
 
 
 # ---------------------------------------------------------------------------
@@ -464,9 +549,8 @@ def report(r: RunResult, manifest: dict[str, dict[str, Any]], log: Log, limit: i
         if len(lines) > limit:
             log(f"  … and {len(lines) - limit} more")
 
-    for w in r.discord.warnings:
-        log(f"warning: {w}")
     log("")
+    log("Summary")
     log(
         f"Discord: {d['new_messages']} new messages in {len(r.discord.items)} items "
         f"({d['new_threads']} new threads, {d['updated_threads']} threads with new messages, "

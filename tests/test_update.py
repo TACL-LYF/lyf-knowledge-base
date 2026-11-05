@@ -393,3 +393,29 @@ def test_raw_snapshots_are_never_uploaded(world):
     world.run()
     assert set(world.kb.folders) == {st.STATE_FOLDER}
     assert world.kb.files == []
+
+
+def test_progress_shows_each_stage_and_its_result(world):
+    world.discord.channel.append(msg(96))
+    world.drive.add("a", "edited", world.now - timedelta(minutes=5))
+    lines = []
+    upd.run_update(world.cfg, log=lines.append, sources=world.sources(), clock=lambda: world.now)
+    text = "\n".join(lines)
+    assert "[1/7] Taking the run lock…" in text
+    assert "[3/7] Reading Discord: messages after the saved cursors…" in text
+    assert "✓ 1 new message in 1 item" in text
+    assert "(1/1) Doc a: changed" in text
+    assert "[7/7] Saving state to Drive…" in text
+    assert "Run lock released." in text
+    assert lines[-1].startswith("Finished in ")
+
+
+def test_progress_marks_the_failed_stage(world):
+    world.fail_after_fetch = True
+    lines = []
+    with pytest.raises(RuntimeError):
+        upd.run_update(world.cfg, log=lines.append, sources=world.sources())
+    failed = [line for line in lines if "✗" in line]
+    assert len(failed) == 1 and failed[0].endswith("s: crash")
+    assert "Listing Drive files" in lines[lines.index(failed[0]) - 1]
+    assert "Run lock released." in lines
