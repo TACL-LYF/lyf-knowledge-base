@@ -27,7 +27,7 @@ class ConfigError(Exception):
 class Config:
     discord_server_id: str
     discord_channel_id: str
-    drive_source_folder_id: str
+    drive_source_folder_ids: list[str]
     drive_kb_folder_id: str
     drive_file_types: list[str] = field(default_factory=lambda: list(DEFAULT_FILE_TYPES))
     llm_model: str = "claude-sonnet-5-5"
@@ -62,6 +62,13 @@ def _resolve(path_str: str, base: Path) -> Path:
     return p if p.is_absolute() else base / p
 
 
+def _id_list(value: object) -> list[str]:
+    """A YAML list (or a single string) of IDs, blanks dropped and duplicates removed."""
+    items = value if isinstance(value, list) else [value]
+    ids = [str(v).strip() for v in items if v is not None]
+    return list(dict.fromkeys(i for i in ids if i))
+
+
 def load_config(path: Path | None = None, env_file: Path | None = None) -> Config:
     """Read config.yaml and .env. Validation of required fields is left to callers."""
     path = path or DEFAULT_CONFIG_PATH
@@ -81,12 +88,18 @@ def load_config(path: Path | None = None, env_file: Path | None = None) -> Confi
     state = raw.get("state") or {}
     paths = raw.get("paths") or {}
 
+    if "source_folder_id" in drive:
+        raise ConfigError(
+            "drive.source_folder_id was replaced by drive.source_folder_ids, a list of folder "
+            "IDs. Rename it in config.yaml (see config.example.yaml)."
+        )
+
     creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
 
     return Config(
         discord_server_id=str(discord.get("server_id") or ""),
         discord_channel_id=str(discord.get("channel_id") or ""),
-        drive_source_folder_id=str(drive.get("source_folder_id") or ""),
+        drive_source_folder_ids=_id_list(drive.get("source_folder_ids")),
         drive_kb_folder_id=str(drive.get("kb_folder_id") or ""),
         drive_file_types=list(drive.get("file_types") or DEFAULT_FILE_TYPES),
         llm_model=str(llm.get("model") or "claude-sonnet-5-5"),

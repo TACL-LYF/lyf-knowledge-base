@@ -1,6 +1,6 @@
 # LYF Knowledge Base
 
-Collects feedback from a Discord channel and a Google Drive folder and publishes one **Consolidated Feedback** Google Doc, organized by programming type and theme, with citations for every piece of feedback.
+Collects feedback from a Discord channel and a set of Google Drive folders and publishes one **Consolidated Feedback** Google Doc, organized by programming type and theme, with citations for every piece of feedback.
 
 The full design and milestones are in [docs/PLAN.md](docs/PLAN.md).
 
@@ -106,7 +106,7 @@ These APIs are free for this amount of use. You don't need to add billing.
    `secrets/kb-pipeline.json`
 3. Store a copy in your team's password manager, so other people who run the pipeline can get it there.
 
-> **The key file works like a password** for the service account. Anyone who has it can read the source folder and edit the Knowledge Base folder. Never commit it, email it, or paste it in Discord. If it leaks, delete that key on the **Keys** tab and create a new one.
+> **The key file works like a password** for the service account. Anyone who has it can read the source folders and edit the Knowledge Base folder. Never commit it, email it, or paste it in Discord. If it leaks, delete that key on the **Keys** tab and create a new one.
 
 > **"Key creation is disabled"?** Some Google Workspace organizations block service account keys with the policy `iam.disableServiceAccountKeyCreation`. Ask your Google Workspace or Cloud admin for an exception for this project.
 
@@ -114,14 +114,14 @@ These APIs are free for this amount of use. You don't need to add billing.
 
 ## 3. Google Drive access pattern
 
-The pipeline works with **two separate Drive folders**. It has different access to each.
+The pipeline works with **two kinds of Drive folder**: one or more source folders it reads, and one Knowledge Base folder it writes. It has different access to each.
 
 ```
-  Source folder                        Knowledge Base folder
+  Source folders                       Knowledge Base folder
   (existing feedback files)            (what the pipeline writes)
   ┌───────────────────────┐            ┌──────────────────────────────┐
   │ Docs, Sheets, Slides  │   read     │ Consolidated Feedback (Doc)  │
-  │ subfolders...         │ ─────────► │ Citations (Sheet)            │
+  │ (one or more folders) │ ─────────► │ Citations (Sheet)            │
   │                       │  pipeline  │ raw/   copies of source text │
   └───────────────────────┘            │ _state/ cursors, manifest... │
    service account: Viewer             └──────────────────────────────┘
@@ -129,13 +129,14 @@ The pipeline works with **two separate Drive folders**. It has different access 
                                          (Content manager in a Shared Drive)
 ```
 
-### Source folder: read-only
+### Source folders: read-only
 
-- **What it is:** the existing Drive folder that holds the feedback Docs, Sheets, and Slides.
-- **Access:** share it with the service account as **Viewer**. Sharing a folder also gives access to everything inside it, including subfolders and files added later.
-- **What the pipeline does here:** lists files and exports their text. It **never** edits, moves, or deletes anything in this folder. Viewer access guarantees that, even if the code has a bug.
-- **How to share:** in Drive, right-click the folder → **Share** → paste the service account email → choose **Viewer** → turn off **Notify people** (the address can't receive mail) → **Share**.
-- **Copy the folder ID** from its URL, `https://drive.google.com/drive/folders/<FOLDER_ID>`. It goes in `config.yaml` as `drive.source_folder_id`.
+- **What they are:** the existing Drive folders that hold the feedback Docs, Sheets, and Slides. List as many as you need.
+- **What's read:** only the files directly inside each folder. Subfolders are skipped for now; reading them is planned for a later milestone. To include a subfolder today, add its ID as another source folder.
+- **Access:** share each folder with the service account as **Viewer**. Sharing a folder also gives access to everything inside it, including files added later.
+- **What the pipeline does here:** lists files and exports their text. It **never** edits, moves, or deletes anything in these folders. Viewer access guarantees that, even if the code has a bug.
+- **How to share:** in Drive, right-click each folder → **Share** → paste the service account email → choose **Viewer** → turn off **Notify people** (the address can't receive mail) → **Share**.
+- **Copy each folder ID** from its URL, `https://drive.google.com/drive/folders/<FOLDER_ID>`. They go in `config.yaml` as a list under `drive.source_folder_ids`.
 
 ### Knowledge Base folder: read and write
 
@@ -158,9 +159,9 @@ The pipeline works with **two separate Drive folders**. It has different access 
 
 ### Rules for the two folders
 
-- **Keep them separate.** Don't put the Knowledge Base folder inside the source folder. If you do, the pipeline reads its own output as if it were new feedback.
-- **Keep them minimal.** The service account should only have access to these two folders. Don't share anything else with it.
-- **If the source folder is in a Shared Drive,** add the service account to that Shared Drive as **Viewer**, or share only the folder with it.
+- **Keep them separate.** Don't put the Knowledge Base folder inside a source folder, or list it as one. If you do, the pipeline reads its own output as if it were new feedback.
+- **Keep them minimal.** The service account should only have access to these folders. Don't share anything else with it.
+- **If a source folder is in a Shared Drive,** add the service account to that Shared Drive as **Viewer**, or share only the folder with it.
 
 ---
 
@@ -187,7 +188,9 @@ Everyone who runs the pipeline does this step.
      server_id: "..."
      channel_id: "..."
    drive:
-     source_folder_id: "..."
+     source_folder_ids:
+       - "..."
+       - "..."
      kb_folder_id: "..."
    ```
 
@@ -206,7 +209,7 @@ python scripts/smoke_test.py   # read-only check of Discord and Drive access
 pytest                         # unit tests (no credentials needed)
 ```
 
-The smoke test reads one message from the channel, one from a thread, lists one file in the source folder, and checks that the Knowledge Base folder is in a Shared Drive and writable by the service account. It prints `PASS`/`FAIL` for each check with a hint when something is missing.
+The smoke test reads one message from the channel, one from a thread, lists one file in each source folder, and checks that the Knowledge Base folder is in a Shared Drive and writable by the service account. It prints `PASS`/`FAIL` for each check with a hint when something is missing.
 
 ---
 

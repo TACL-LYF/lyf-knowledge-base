@@ -3,7 +3,7 @@
 Checks:
   1. Discord: read one message from the main channel.
   2. Discord: read one message from a thread in the channel (active or archived).
-  3. Drive: list one file in the source folder.
+  3. Drive: list one file in each source folder.
   4. Drive: the Knowledge Base folder is in a Shared Drive and the service account can add files.
 
 Run from the repo root:  python scripts/smoke_test.py
@@ -90,22 +90,32 @@ def check_drive(cfg) -> None:
     print(f"       service account: {gdrive.service_account_email(key)}")
     svc = gdrive.drive_service(key)
 
-    try:
-        page = gdrive.list_children(svc, cfg.drive_source_folder_id, page_size=20)
-        files = [f for f in page.get("files", []) if f["mimeType"] != gdrive.FOLDER_MIME]
-        in_scope = [f for f in files if f["mimeType"] in cfg.drive_file_types]
-        pick = (in_scope or files or page.get("files", []) or [None])[0]
-        if pick is None:
-            record("Drive source file", False, "source folder is empty or not shared")
-        else:
-            record(
-                "Drive source file",
-                True,
-                f"{pick['name']} ({pick['mimeType'].rsplit('.', 1)[-1]}) · "
-                f"{pick.get('webViewLink')}",
-            )
-    except Exception as e:  # googleapiclient raises HttpError with useful text
-        record("Drive source file", False, f"{type(e).__name__}: {e}")
+    for folder_id in cfg.drive_source_folder_ids:
+        label = f"Drive source file ({folder_id})"
+        try:
+            page = gdrive.list_children(svc, folder_id, page_size=20)
+            files = [f for f in page.get("files", []) if f["mimeType"] != gdrive.FOLDER_MIME]
+            in_scope = [f for f in files if f["mimeType"] in cfg.drive_file_types]
+            pick = (in_scope or files or page.get("files", []) or [None])[0]
+            if pick is None:
+                record(label, False, "source folder is empty or not shared")
+            else:
+                record(
+                    label,
+                    True,
+                    f"{pick['name']} ({pick['mimeType'].rsplit('.', 1)[-1]}) · "
+                    f"{pick.get('webViewLink')}",
+                )
+        except Exception as e:  # googleapiclient raises HttpError with useful text
+            record(label, False, f"{type(e).__name__}: {e}")
+
+    if cfg.drive_kb_folder_id in cfg.drive_source_folder_ids:
+        record(
+            "Drive folders separate",
+            False,
+            "the Knowledge Base folder is also a source folder, so the pipeline would read "
+            "its own output",
+        )
 
     try:
         kb = gdrive.get_file(
@@ -134,7 +144,7 @@ def main() -> int:
             "discord_server_id",
             "discord_channel_id",
             "discord_bot_token",
-            "drive_source_folder_id",
+            "drive_source_folder_ids",
             "drive_kb_folder_id",
             "google_credentials_path",
         )

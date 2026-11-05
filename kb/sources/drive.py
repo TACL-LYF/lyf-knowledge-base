@@ -1,11 +1,12 @@
-"""Google Drive source: list files in the source folder and export their text.
+"""Google Drive source: list files in the source folders and export their text.
 
-M0 has just enough to prove access (list one file, check the KB folder is writable).
-M1 adds recursive listing and exporters; M2 adds the manifest comparison.
+Only the direct children of each source folder are read for now; recursive listing
+comes in a later milestone. M1 adds exporters; M2 adds the manifest comparison.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,32 @@ def list_children(
         )
         .execute()
     )
+
+
+def list_folder_files(
+    drive: Any, folder_ids: Iterable[str], mime_types: Iterable[str] | None = None
+) -> Iterator[dict[str, Any]]:
+    """Every file directly inside any of the folders (subfolders are skipped, not entered).
+
+    A file reachable from more than one folder is returned once. If mime_types is
+    given, only files of those types are returned.
+    """
+    wanted = set(mime_types) if mime_types is not None else None
+    seen: set[str] = set()
+    for folder_id in folder_ids:
+        token: str | None = None
+        while True:
+            page = list_children(drive, folder_id, page_size=1000, page_token=token)
+            for f in page.get("files", []):
+                if f["mimeType"] == FOLDER_MIME or f["id"] in seen:
+                    continue
+                if wanted is not None and f["mimeType"] not in wanted:
+                    continue
+                seen.add(f["id"])
+                yield f
+            token = page.get("nextPageToken")
+            if not token:
+                break
 
 
 def get_file(drive: Any, file_id: str, fields: str = FILE_FIELDS) -> dict[str, Any]:
