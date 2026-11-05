@@ -38,7 +38,7 @@ import json
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Protocol
 
 from kb import extract as ext
 from kb import llm as llm_mod
@@ -625,8 +625,12 @@ def build_items(
 STEPS = ("pull", "extract")  # M4 adds "synthesize"
 
 
-def pick(items: list[ext.Item], limit: int | None) -> tuple[list[ext.Item], list[ext.Item]]:
-    """The first `limit` items, alternating Discord and Drive; the rest wait."""
+def pick(items: list[Any], limit: int | None) -> tuple[list[Any], list[Any]]:
+    """The first `limit` items, alternating Discord and Drive; the rest wait.
+
+    Works on anything with `.id` and `.discord` (None for Drive): extraction items, or
+    the not-yet-loaded Drive files of `waiting_items`.
+    """
     if limit is None or limit >= len(items):
         return items, []
     discord = [i for i in items if i.discord is not None]
@@ -653,26 +657,46 @@ def rendered_body(text: str) -> str:
 class Waiting:
     """Items `kb update --extract` can extract without reading Discord or Drive."""
 
-    items: list[ext.Item] = field(default_factory=list)
+    items: list[ext.Item] = field(default_factory=list)  # to extract this run
+    deferred: list[str] = field(default_factory=list)  # item IDs left waiting (--limit)
     retry_items: dict[str, dict[str, Any]] = field(default_factory=dict)  # Discord, by ID
     need_pull: list[str] = field(default_factory=list)  # titles: no saved copy to extract from
 
 
+class RawSnapshots(Protocol):
+    def has(self, file_id: str) -> bool: ...
+    def read(self, file_id: str) -> str | None: ...
+
+
+@dataclass
+class _DriveCandidate:
+    """A waiting Drive file whose snapshot hasn't been downloaded yet (see `pick`)."""
+
+    id: str
+    entry: dict[str, Any]
+    discord: None = None
+
+
 def waiting_items(
-    manifest: dict[str, dict[str, Any]], read_raw: Callable[[str], str | None]
+    manifest: dict[str, dict[str, Any]],
+    raw: RawSnapshots,
+    limit: int | None = None,
+    detail: Log = lambda _: None,
 ) -> Waiting:
     """Discord items with saved messages, and Drive files with a raw snapshot, to extract.
 
-    `read_raw(file_id)` returns the saved export of a Drive file, or None.
+    Only the snapshots of the items chosen for this run (the first `limit`, picked as
+    `pick` does) are downloaded; the rest are listed in `deferred` without being read.
     """
     out = Waiting()
+    candidates: list[Any] = []  # Discord items and Drive candidates, in manifest order
     for item_id, entry in manifest.items():
         status = entry.get("status")
         if entry.get("source") == "discord":
             retry = entry.get("retry_item")
             if status in ("error", "pending") and retry:
                 out.retry_items[item_id] = retry
-                out.items.append(
+                candidates.append(
                     ext.discord_item(
                         retry, replace=bool(retry.get("replace")), edited=retry.get("edited", ())
                     )
@@ -688,9 +712,28 @@ def waiting_items(
             or needs_extraction(entry)
         ):
             continue
-        text = read_raw(item_id.removeprefix("drive:"))
-        if text is None:
+        if not raw.has(item_id.removeprefix("drive:")):
             out.need_pull.append(str(entry.get("title") or item_id))
+            continue
+        candidates.append(_DriveCandidate(item_id, entry))
+
+    chosen, later = pick(candidates, limit)
+    out.deferred = [c.id for c in later]
+    to_read = sum(1 for c in chosen if isinstance(c, _DriveCandidate))
+    if to_read:
+        detail(f"downloading {_plural(to_read, 'Drive snapshot')} from raw/drive/")
+    done = 0
+    for c in chosen:
+        if not isinstance(c, _DriveCandidate):
+            out.items.append(c)
+            continue
+        entry = c.entry
+        text = raw.read(c.id.removeprefix("drive:"))
+        done += 1
+        if done == to_read or done % 25 == 0:
+            detail(f"{done}/{to_read} downloaded")
+        if text is None:  # removed since the listing
+            out.need_pull.append(str(entry.get("title") or c.id))
             continue
         meta = {k: entry.get(k) for k in ("id", "source", "title", "link", "owner")}
         meta["modified_time"] = entry.get("modified_time")
@@ -711,6 +754,10 @@ def apply_waiting(
         if item.drive is not None:
             entry["estimated_tokens"] = item.tokens
         _set_extraction_status(entry, item.id, extracted, waiting.retry_items.get(item.id))
+    for item_id in waiting.deferred:  # not read this run: only the status changes
+        _set_extraction_status(
+            state.manifest[item_id], item_id, extracted, waiting.retry_items.get(item_id)
+        )
 
 
 def run_update(
@@ -801,9 +848,14 @@ def run_update(
             stages.skip("Reading Discord", "--extract only")
             stages.skip("Listing Drive files", "--extract only")
             with stages.stage("Loading items waiting for extraction") as s:
-                waiting = waiting_items(state.manifest, _raw_reader(sources.kb_folder))
+                s.detail("listing raw/drive/ in the Knowledge Base folder")
+                waiting = waiting_items(
+                    state.manifest, _raw_snapshots(sources.kb_folder), limit, s.detail
+                )
                 items = waiting.items
                 s.result = f"{_plural(len(items), 'item')} to extract"
+                if waiting.deferred:
+                    s.result += f", {len(waiting.deferred)} more wait (--limit {limit})"
                 if waiting.need_pull:
                     s.result += (
                         f"; {_plural(len(waiting.need_pull), 'item')} need a full "
@@ -814,15 +866,16 @@ def run_update(
             items, later = [], items
             why = "--pull only"
         else:
-            items, later = pick(items, limit)
+            items, later = pick(items, limit)  # --extract: waiting_items already picked
             why = f"--limit {limit}"
+        later_ids = [i.id for i in later] + (waiting.deferred if waiting else [])
         # `--limit 0` reads (unless --extract) but extracts nothing, like --pull.
         no_extract = None if extracting and limit != 0 else why
 
         result = RunResult(
             run=run, discord=discord, drive=drive, dry_run=dry_run, items=items + later
         )
-        result.deferred = {i.id: why for i in later}
+        result.deferred = {i: why for i in later_ids}
         result.waiting = waiting
         if dry_run:
             stages.skip("Saving raw snapshots", "dry run")
@@ -830,8 +883,8 @@ def run_update(
                 with stages.stage("Estimating extraction size and cost (no LLM calls)") as s:
                     result.estimate = ext.estimate(items, store.types.names, cfg)
                     s.result = estimate_line(result.estimate, cfg)
-                    if later:
-                        s.result += f"; {len(later)} more wait ({why})"
+                    if later_ids:
+                        s.result += f"; {len(later_ids)} more wait ({why})"
             else:
                 stages.skip("Estimating extraction size and cost", no_extract)
             stages.skip("Saving state to Drive", "dry run")
@@ -846,15 +899,17 @@ def run_update(
             stages.skip("Saving raw snapshots", "--extract only")
 
         if no_extract:
-            stages.skip("Extracting records", f"{no_extract}; {_plural(len(later), 'item')} wait")
+            stages.skip(
+                "Extracting records", f"{no_extract}; {_plural(len(later_ids), 'item')} wait"
+            )
             result.extracted = ext.ExtractResult(usage=llm_mod.Usage(model=cfg.llm_extract_model))
         elif not items:
             stages.skip("Extracting records", "nothing new")
             result.extracted = ext.ExtractResult(usage=llm_mod.Usage(model=cfg.llm_extract_model))
         else:
             title = f"Extracting records from {_plural(len(items), 'item')}"
-            if later:
-                title += f" ({len(later)} more wait: {why})"
+            if later_ids:
+                title += f" ({len(later_ids)} more wait: {why})"
             with stages.stage(title) as s:
                 result.extracted = ext.run(items, store, sources.llm, cfg, started_at, s.detail)
                 x = result.extracted
@@ -978,20 +1033,34 @@ def _pull(
     return pull, discord, retried, drive, files_by_id
 
 
-def _raw_reader(kb_folder: st.RemoteFolder) -> Callable[[str], str | None]:
-    """Read a Drive file's raw snapshot from raw/drive/ in the Knowledge Base folder.
+class _RemoteSnapshots:
+    """Drive files' raw snapshots in raw/drive/ in the Knowledge Base folder.
 
-    Only the copy in Drive is used: local files in data/raw/ may come from `kb pull` or
-    an older exporter, and needn't match what the last `kb update` pulled.
+    The folder is listed once, so checking for a snapshot costs nothing and reading one
+    is a single download. Only the copy in Drive is used: local files in data/raw/ may
+    come from `kb pull` or an older exporter, and needn't match what the last
+    `kb update` pulled.
     """
-    raw = kb_folder.subfolder(st.RAW_FOLDER, create=False)
-    remote = raw.subfolder("drive", create=False) if raw is not None else None
 
-    def read(file_id: str) -> str | None:
-        data = remote.read(f"{file_id}.md") if remote is not None else None
-        return None if data is None else data.decode("utf-8")
+    def __init__(self, kb_folder: st.RemoteFolder) -> None:
+        raw = kb_folder.subfolder(st.RAW_FOLDER, create=False)
+        self.folder = raw.subfolder("drive", create=False) if raw is not None else None
+        self.ids: dict[str, str] = {}
+        for f in self.folder.list() if self.folder is not None else []:
+            self.ids.setdefault(f["name"], f["id"])  # oldest first, like `read`
 
-    return read
+    def has(self, file_id: str) -> bool:
+        return f"{file_id}.md" in self.ids
+
+    def read(self, file_id: str) -> str | None:
+        fid = self.ids.get(f"{file_id}.md")
+        if fid is None or self.folder is None:
+            return None
+        return self.folder.read_id(fid).decode("utf-8")
+
+
+def _raw_snapshots(kb_folder: st.RemoteFolder) -> RawSnapshots:
+    return _RemoteSnapshots(kb_folder)
 
 
 def estimate_line(e: ext.Estimate, cfg: Config) -> str:

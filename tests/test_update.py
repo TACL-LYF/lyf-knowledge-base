@@ -873,6 +873,27 @@ def test_pull_only_then_extract_only(fresh):
     assert [r.user.count("[12]") for r in fresh.llm.requests] == [1]
 
 
+def test_extract_only_with_limit_downloads_only_the_chosen_snapshots(fresh):
+    fresh.run(steps=["pull"])
+    raw = fresh.kb.subfolder(st.RAW_FOLDER).subfolder("drive")
+    read: list[str] = []
+    real = raw.read_id
+    raw.read_id = lambda fid: read.append(fid) or real(fid)
+    lines: list[str] = []
+    r = upd.run_update(
+        fresh.cfg, log=lines.append, sources=fresh.sources(), steps=["extract"], limit=2
+    )
+    names = {f["id"]: f["name"] for f in raw.list()}
+    assert [names[f] for f in read] == ["a.md"]  # drive:b waits, so it isn't downloaded
+    assert len(fresh.llm.requests) == 2
+    assert sorted(r.deferred) == ["discord-msg:11", "discord-thread:20", "drive:b"]
+    s = statuses(fresh)
+    assert s["drive:a"] == "ok" and s["drive:b"] == "pending"
+    assert fresh.state()["manifest"]["drive:b"]["pending_reason"] == "--limit 2"
+    out = "\n".join(lines)
+    assert "1/1 downloaded" in out and "3 more wait (--limit 2)" in out
+
+
 def test_extract_only_reads_the_drive_file_from_its_raw_snapshot(fresh):
     fresh.run(steps=["pull"])
     fresh.drive.bodies["a"] = "edited after the pull"

@@ -80,6 +80,9 @@ class RemoteFolder(Protocol):
     def read(self, name: str) -> bytes | None:
         """Contents of the file with this name, or None if there isn't one."""
 
+    def read_id(self, file_id: str) -> bytes:
+        """Contents of the file with this ID (from `list`)."""
+
     def write(self, name: str, data: bytes, mime: str = "application/json") -> None:
         """Create the file, or replace the contents of the existing one with this name."""
 
@@ -215,6 +218,9 @@ class MemoryFolder:
     def read(self, name: str) -> bytes | None:
         f = next((f for f in self.files if f["name"] == name), None)
         return None if f is None else f["data"]
+
+    def read_id(self, file_id: str) -> bytes:
+        return next(f["data"] for f in self.files if f["id"] == file_id)
 
     def write(self, name: str, data: bytes, mime: str = "application/json") -> None:
         f = next((f for f in self.files if f["name"] == name), None)
