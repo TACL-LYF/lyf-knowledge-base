@@ -92,8 +92,9 @@ def main() -> None:
 )
 @click.option(
     "--limit",
-    type=click.IntRange(min=1),
-    help="Extract at most this many items (Discord and Drive alternating); the rest wait.",
+    type=click.IntRange(min=0),
+    help="Extract at most this many items (Discord and Drive alternating); the rest wait. "
+    "0 skips extraction.",
 )
 @click.option("--force-unlock", is_flag=True, help="Clear a stale run lock before starting.")
 def update(

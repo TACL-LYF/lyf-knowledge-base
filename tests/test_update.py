@@ -907,6 +907,20 @@ def test_dry_run_with_limit_estimates_only_those_items(fresh):
     assert r.estimate.requests == 1 and len(r.deferred) == 4
 
 
+def test_limit_zero_pulls_but_skips_extraction(fresh):
+    r = fresh.run(limit=0)
+    assert fresh.llm.requests == [] and r.extracted.records == 0
+    assert set(statuses(fresh).values()) == {"pending"}
+    assert fresh.state()["manifest"]["drive:a"]["pending_reason"] == "--limit 0"
+    fresh.run()
+    assert set(statuses(fresh).values()) == {"ok"}
+
+
+def test_dry_run_with_limit_zero_skips_the_estimate(fresh):
+    r = fresh.run(dry_run=True, limit=0)
+    assert r.estimate is None and len(r.deferred) == 5
+
+
 def test_pending_rebuild_item_still_replaces_its_records(world):
     world.llm.fail = ["[20]"]
     world.run(rebuild=True)

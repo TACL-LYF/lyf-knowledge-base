@@ -292,7 +292,7 @@ By default `kb update` runs every step: pull (read Discord and Drive), then extr
 
 - `--pull` reads and saves as usual (raw snapshots, manifest, cursors) but sends nothing to the model, so it doesn't need `ANTHROPIC_API_KEY`. New items get status `pending`. Discord items keep their messages in the manifest, because the cursors have moved past them.
 - `--extract` doesn't read Discord or Drive. It extracts pending items, items whose extraction failed, and Drive files never extracted. Drive files are read from their snapshot in `raw/drive/` in the Knowledge Base folder, so it extracts what the last pull saw. Discord items read before extraction existed have no saved messages, so they wait for a normal `kb update`.
-- `--limit N` (with or without `--extract`) extracts at most N items and leaves the rest `pending`.
+- `--limit N` (with or without `--extract`) extracts at most N items and leaves the rest `pending`. `--limit 0` reads but skips extraction (everything new waits as `pending`).
 - A normal `kb update` also picks up pending items. It exports pending Drive files again, so it extracts their latest text.
 
 **A small first run.** Before the full first run, check that everything works end to end with a handful of items:

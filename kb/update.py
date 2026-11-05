@@ -23,7 +23,7 @@ locally, so they aren't paid for twice). Publishing (M4) slots in before step 6.
 Steps: `--pull` runs 1–4 and 6, leaving new items `pending`; `--extract` skips 2–4 and
 extracts pending items (Discord items keep their messages in the manifest; Drive files
 are read from their raw snapshot in Drive). `--limit N` extracts at most N items and
-leaves the rest `pending`.
+leaves the rest `pending`; `--limit 0` skips extraction entirely.
 
 A manifest entry without `prompt_version` has never been extracted (for example, items
 read before extraction existed). Such Drive files are exported and extracted again, and
@@ -808,12 +808,14 @@ def run_update(
                         "`kb update` first (no saved copy to extract from)"
                     )
 
-        if extracting:
-            items, later = pick(items, limit)
-            why = f"--limit {limit}"
-        else:
+        if not extracting:
             items, later = [], items
             why = "--pull only"
+        else:
+            items, later = pick(items, limit)
+            why = f"--limit {limit}"
+        # `--limit 0` reads (unless --extract) but extracts nothing, like --pull.
+        no_extract = None if extracting and limit != 0 else why
 
         result = RunResult(
             run=run, discord=discord, drive=drive, dry_run=dry_run, items=items + later
@@ -822,14 +824,14 @@ def run_update(
         result.waiting = waiting
         if dry_run:
             stages.skip("Saving raw snapshots", "dry run")
-            if extracting:
+            if not no_extract:
                 with stages.stage("Estimating extraction size and cost (no LLM calls)") as s:
                     result.estimate = ext.estimate(items, store.types.names, cfg)
                     s.result = estimate_line(result.estimate, cfg)
                     if later:
                         s.result += f"; {len(later)} more wait ({why})"
             else:
-                stages.skip("Estimating extraction size and cost", "--pull only")
+                stages.skip("Estimating extraction size and cost", no_extract)
             stages.skip("Saving state to Drive", "dry run")
             return result
 
@@ -841,8 +843,8 @@ def run_update(
         else:
             stages.skip("Saving raw snapshots", "--extract only")
 
-        if not extracting:
-            stages.skip("Extracting records", f"--pull only; {_plural(len(later), 'item')} wait")
+        if no_extract:
+            stages.skip("Extracting records", f"{no_extract}; {_plural(len(later), 'item')} wait")
             result.extracted = ext.ExtractResult(usage=llm_mod.Usage(model=cfg.llm_extract_model))
         elif not items:
             stages.skip("Extracting records", "nothing new")
