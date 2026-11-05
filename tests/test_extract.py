@@ -424,3 +424,42 @@ def test_ctrl_c_during_direct_requests_does_not_send_the_queued_ones(monkeypatch
     with pytest.raises(KeyboardInterrupt):
         model.run(reqs(*map(str, range(40))), log)
     assert len(sent) < 20  # only the running ones finished; the rest were never sent
+
+
+def test_drive_citations_credit_the_owner_only_when_it_looks_right():
+    from kb.citations import drive_author
+
+    assert drive_author("ana", "2024 Night Market Plan") == "ana"
+    assert drive_author("ana", "2023 Post Camp Debrief") == "unknown"
+    assert drive_author("ana", "LYF 2026 Staff Trivia (Responses)") == "unknown"
+    assert drive_author("ana", "George's Notes on Campfire") == "unknown"
+    assert drive_author("ana", "2024 Families STR Feedback Doc") == "unknown"
+    assert drive_author("ana", "2024 Night Market Plan", owner_is_editor=True) == "unknown"
+    assert drive_author(None, "Plan") == "unknown"
+
+    cites = Citations()
+    entry = {"id": "drive:f1", "source": "doc", "title": "2024 Family Survey", "owner": "bo"}
+    cid = cites.for_drive_file(entry, "now")
+    row = cites.get(cid)
+    assert row["author"] == "unknown" and row["owner"] == "bo"
+    cites.refresh_drive({**entry, "title": "2024 Family Plan"})
+    assert row["author"] == "bo"
+
+
+def test_saved_drive_citations_are_re_credited():
+    old = [
+        {"id": "C-0001", "key": "drive:a", "source": "doc", "author": "ana", "context": "Debrief"},
+        {"id": "C-0002", "key": "drive:b", "source": "doc", "author": "ana", "context": "Plan"},
+        {
+            "id": "C-0003",
+            "key": "discord:1",
+            "source": "discord",
+            "author": "bo",
+            "context": "#x › notes",
+        },
+    ]
+    cites = Citations(old)
+    assert cites.apply_author_rule() == 1
+    assert [c["author"] for c in cites.rows] == ["unknown", "ana", "bo"]
+    assert cites.rows[0]["owner"] == "ana"
+    assert cites.apply_author_rule() == 0  # stable

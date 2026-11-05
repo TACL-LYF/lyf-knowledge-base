@@ -26,6 +26,7 @@ def _run(
     steps: tuple[str, ...] = upd.STEPS,
     limit: int | None = None,
     read: tuple[str, ...] = upd.SOURCES,
+    force_synthesize: bool = False,
 ) -> None:
     try:
         cfg = load_config()
@@ -35,7 +36,7 @@ def _run(
                 *(DISCORD_SETTINGS if "discord" in read else ()),
                 *(DRIVE_SETTINGS if "drive" in read else ()),
             )
-        if not dry_run and "extract" in steps:
+        if not dry_run and ("extract" in steps or "synthesize" in steps):
             cfg.require("anthropic_api_key")
         result = upd.run_update(
             cfg,
@@ -46,6 +47,7 @@ def _run(
             limit=limit,
             read=read,
             force_unlock=force_unlock,
+            force_synthesize=force_synthesize,
             log=click.echo,
         )
     except (ConfigError, DiscordError, LockError) as e:
@@ -60,15 +62,21 @@ def _run(
         raise click.ClickException(f"The Anthropic API denied the request (403): {e}") from e
     except anthropic.NotFoundError as e:
         raise click.ClickException(
-            f"Anthropic API: model not found ({e}). Check llm.extract_model in config.yaml."
+            f"Anthropic API: model not found ({e}). Check llm.extract_model and "
+            "llm.synthesis_model in config.yaml."
         ) from e
     upd.report(result, upd.st.State(cfg.data_dir / "state").load().manifest, click.echo)
+    if result.synth_error:
+        raise click.ClickException(
+            f"Synthesis or publishing failed: {result.synth_error}. Everything else this run "
+            "did was saved; `kb update --synthesize` tries the docs again."
+        )
 
 
 @click.group()
 @click.version_option(__version__, prog_name="kb")
 def main() -> None:
-    """Consolidate feedback from Discord and Google Drive into one cited Google Doc."""
+    """Consolidate feedback from Discord and Google Drive into cited Google Docs."""
 
 
 @main.command()
@@ -87,6 +95,12 @@ def main() -> None:
     "only_extract",
     is_flag=True,
     help="Only extract items waiting from earlier runs; don't read Discord or Drive.",
+)
+@click.option(
+    "--synthesize",
+    "only_synthesize",
+    is_flag=True,
+    help="Only rebuild and publish the docs from the saved records, even if nothing changed.",
 )
 @click.option(
     "--limit",
@@ -109,31 +123,30 @@ def update(
     full: bool,
     only_pull: bool,
     only_extract: bool,
+    only_synthesize: bool,
     limit: int | None,
     read: tuple[str, ...],
     force_unlock: bool,
 ) -> None:
-    """Read new content and extract feedback and program facts from it.
+    """Read new content, extract feedback and program facts, and publish the docs.
 
-    By default every step runs. --pull and --extract run just that step (both together
-    is the same as neither). Items that are read but not extracted wait as `pending` and
-    are extracted by the next run that extracts. --source limits the run to Discord or
-    Drive. For example, after `kb requeue`, `--pull --source discord` saves Discord's
-    messages for extraction without exporting every Drive file again.
+    By default every step runs: read Discord and Drive, extract records from what's new,
+    then rebuild and publish the Consolidated Feedback and Programs docs and the
+    Citations sheet (only if something changed since the last publish). --pull,
+    --extract, and --synthesize run just those steps (all three together is the same as
+    none). Items that are read but not extracted wait as `pending` and are extracted by
+    the next run that extracts. --synthesize rebuilds the docs even if nothing changed.
+    --source limits reading and extraction to Discord or Drive.
 
     Use --dry-run first to see the token and cost estimate, and --limit 5 for a small
-    first real run. The docs themselves arrive in M4.
+    first real run.
     """
-    steps = (
-        tuple(s for s, on in zip(upd.STEPS, (only_pull, only_extract), strict=True) if on)
-        or upd.STEPS
-    )
-    if limit is not None and steps == ("pull",):
-        raise click.UsageError("--limit applies to extraction; it can't be used with --pull.")
-    if full and steps == ("extract",):
-        raise click.UsageError(
-            "--full applies to reading Discord; it can't be used with --extract."
-        )
+    flags = (only_pull, only_extract, only_synthesize)
+    steps = tuple(s for s, on in zip(upd.STEPS, flags, strict=True) if on) or upd.STEPS
+    if limit is not None and "extract" not in steps:
+        raise click.UsageError("--limit applies to extraction; add --extract or leave it out.")
+    if full and "pull" not in steps:
+        raise click.UsageError("--full applies to reading Discord; add --pull or leave it out.")
     _run(
         dry_run,
         full,
@@ -142,6 +155,7 @@ def update(
         steps=steps,
         limit=limit,
         read=read or upd.SOURCES,
+        force_synthesize=only_synthesize,
     )
 
 
@@ -193,7 +207,7 @@ def status() -> None:
     "--force-unlock", is_flag=True, help="Clear a stale run lock, or your own, before starting."
 )
 def rebuild(dry_run: bool, yes: bool, force_unlock: bool) -> None:
-    """Extract everything again (e.g., after a big prompt change).
+    """Extract everything again (e.g., after a big prompt change), then publish the docs.
 
     Reads the whole Discord channel, exports every Drive file, and sends every item to
     the model again. Citation IDs stay the same; each item's records are replaced once

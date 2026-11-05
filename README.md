@@ -1,10 +1,10 @@
 # LYF Knowledge Base
 
-Collects feedback from a Discord channel and a set of Google Drive folders and publishes one **Consolidated Feedback** Google Doc, organized by programming type and theme, with citations for every piece of feedback.
+Collects feedback from a Discord channel and a set of Google Drive folders and publishes two Google Docs: **Consolidated Feedback**, organized by programming type and theme, and **Programs**, which describes each programming type, its history, and how to run it. Every piece of feedback and every program fact is cited back to its source.
 
 The full design and milestones are in [docs/PLAN.md](docs/PLAN.md).
 
-> **Status:** M3 (extraction and citations). `kb update` reads only what's new since the last run and turns it into cited records (feedback and program facts) with Claude, with state shared in Drive; `kb status` shows where things stand. The Consolidated Feedback and Programs docs arrive in M4.
+> **Status:** M4 (synthesis and publish). `kb update` reads only what's new since the last run, turns it into cited records (feedback and program facts) with Claude, and rebuilds the Consolidated Feedback and Programs docs and the Citations sheet in the Knowledge Base folder, with state shared in Drive; `kb status` shows where things stand.
 
 ## Contents
 
@@ -84,7 +84,7 @@ A **service account** is a Google account that belongs to the pipeline rather th
 2. Open the project picker at the top → **New Project**. Name it (for example, `lyf-knowledge-base`) and click **Create**. Make sure the new project is selected.
 3. Go to **APIs & Services → Library**. Search for each of these APIs and click **Enable**:
    - **Google Drive API**: list, export, and upload files
-   - **Google Docs API**: read Docs
+   - **Google Docs API**: read Docs, and fix the section links in the published docs
    - **Google Sheets API**: read every tab of a Sheet, and write the Citations sheet
    - **Google Slides API**: read slide text and speaker notes
 
@@ -121,8 +121,9 @@ The pipeline works with **two kinds of Drive folder**: one or more source folder
   (existing feedback files)            (what the pipeline writes)
   ┌───────────────────────┐            ┌──────────────────────────────┐
   │ Docs, Sheets, Slides  │   read     │ Consolidated Feedback (Doc)  │
-  │ (one or more folders) │ ─────────► │ Citations (Sheet)            │
-  └───────────────────────┘            │ _state/ cursors, manifest... │
+  │ (one or more folders) │ ─────────► │ Programs (Doc)               │
+  └───────────────────────┘            │ Citations (Sheet)            │
+                                       │ _state/ cursors, manifest... │
    service account: Viewer             └──────────────────────────────┘
                                          service account: Editor
                                          (Content manager in a Shared Drive)
@@ -143,8 +144,9 @@ The pipeline works with **two kinds of Drive folder**: one or more source folder
 
   | Item                    | Purpose                                | Who uses it                                |
   | ----------------------- | -------------------------------------- | ------------------------------------------ |
-  | `Consolidated Feedback` | The output doc                         | The whole team reads it                    |
-  | `Citations`             | Running list of every citation         | Anyone checking a source                   |
+  | `Consolidated Feedback` | Feedback by programming type and theme | The whole team reads it                    |
+  | `Programs`              | Each programming type and its history  | Whoever runs a program next                |
+  | `Citations`             | Every citation, and every record       | Anyone checking a source or filtering      |
   | `_state/`               | Cursors, manifest, saved records, lock | Only the pipeline. **Don't edit by hand.** |
 
 - **Access:** the service account needs **Editor** access, so it can create and update files.
@@ -153,7 +155,7 @@ The pipeline works with **two kinds of Drive folder**: one or more source folder
   2. Shared Drive → **Manage members** → add the service account email as **Content manager**.
   3. Shared Drives need Google Workspace. If you only have personal Google accounts, flag this before M2, because the pipeline would need a different way to write files (for example, signing in as a person for writes).
 - **Copy the folder ID** from its URL. It goes in `config.yaml` as `drive.kb_folder_id`.
-- **Team access:** share the Knowledge Base folder (or only the Consolidated Feedback doc) with teammates as **Viewer** or **Commenter**. People who run the pipeline don't need any Drive access of their own, since the pipeline acts as the service account.
+- **Team access:** share the Knowledge Base folder (or only the two docs and the Citations sheet) with teammates as **Viewer** or **Commenter**. People who run the pipeline don't need any Drive access of their own, since the pipeline acts as the service account.
 
 ### Rules for the two folders
 
@@ -255,11 +257,12 @@ Looking up each author's server nickname takes one Discord API call per person, 
 ### Full pipeline
 
 ```bash
-kb update             # normal run: new Discord messages + new/changed Drive files → records
-kb update --dry-run   # show what's new and the token/cost estimate; no LLM calls, nothing saved
+kb update             # normal run: new Discord messages + new/changed Drive files → records → docs
+kb update --dry-run   # show what's new and the token/cost estimates; no LLM calls, nothing saved
 kb update --limit 5   # extract only 5 items (Discord and Drive alternating); the rest wait
 kb update --pull      # only read Discord and Drive; new items wait as `pending`
 kb update --extract   # only extract pending items, from what the last pull saved in raw/
+kb update --synthesize   # only rebuild and publish the docs from the saved records
 kb update --source discord   # only read and extract Discord (or `drive`); works with the flags above
 kb status             # last run, lock, cursors, item counts, errors, skipped files, records
 kb update --full      # rare: read the whole Discord channel and export every Drive file again
@@ -273,7 +276,7 @@ The first `kb update` reads everything, because there's no saved state yet. Afte
 - **Drive:** files not seen before (including old files moved into a source folder), and files modified since the last run started. If a modified file's text is the same (for example, only a comment was added), it's skipped.
 - **Removed Drive files** are marked `removed` in the manifest.
 
-A run saves the new content locally (`data/raw/discord/YYYY-MM-DD.json`, `data/raw/drive/<fileId>.md`), uploads the same files to `raw/` in the Knowledge Base folder, extracts records from it, and updates `_state/` in Drive. The docs (M4) will plug into the same run.
+A run saves the new content locally (`data/raw/discord/YYYY-MM-DD.json`, `data/raw/drive/<fileId>.md`), uploads the same files to `raw/` in the Knowledge Base folder, extracts records from it, rebuilds the docs if anything changed, and updates `_state/` in Drive.
 
 #### Extraction
 
@@ -292,11 +295,12 @@ Every record has `applies_to` (the period it's about, `YYYY`, `YYYY-MM`, or `YYY
 
 #### Running steps separately
 
-By default `kb update` runs every step: pull (read Discord and Drive), then extract. M4 adds synthesize. `--pull` and `--extract` run just one step:
+By default `kb update` runs every step: pull (read Discord and Drive), extract, then synthesize (rebuild and publish the docs). `--pull`, `--extract`, and `--synthesize` run just those steps:
 
 - `--pull` reads and saves as usual (raw snapshots, manifest, cursors) but sends nothing to the model, so it doesn't need `ANTHROPIC_API_KEY`. New items get status `pending`. Discord items keep their messages in the manifest, because the cursors have moved past them.
 - `--extract` doesn't read Discord or Drive. It extracts pending items, items whose extraction failed, and Drive files never extracted. Drive files are read from their snapshot in `raw/drive/` in the Knowledge Base folder, so it extracts what the last pull saw. Discord items read before extraction existed have no saved messages, so they wait for a normal `kb update`.
 - `--limit N` (with or without `--extract`) extracts at most N items and leaves the rest `pending`. `--limit 0` reads but skips extraction (everything new waits as `pending`).
+- `--synthesize` doesn't read or extract anything. It rebuilds and publishes the docs from the saved records, even if nothing changed since the last publish (for example, after changing `llm.synthesis_model` or a synthesis prompt).
 - A normal `kb update` also picks up pending items. It exports pending Drive files again, so it extracts their latest text.
 
 **A small first run.** Before the full first run, check that everything works end to end with a handful of items:
@@ -328,5 +332,23 @@ Each item keeps its old records until its new ones replace them, so for a while 
 The Discord pull is needed because only a hash of each message is kept once it's extracted, so `kb update --extract` has nothing to re-extract a Discord item from until Discord is read again. Drive files don't need it: their text is in `raw/drive/`. A plain `kb update --limit 10` works too, but it exports every Drive file again first, since they all count as not extracted.
 
 `--source discord` or `--source drive` limits any `kb update` to one source: only that source is read, and only its items are extracted. A Discord-only run doesn't move the "last run started" time that Drive's "modified since the last run" check uses, so Drive edits made in the meantime are still picked up by the next run that reads Drive.
+
+#### The docs
+
+After extraction, every saved record is regrouped and both docs are rewritten in place, so their links never change. This happens only when something they're built from changed since the last publish; a run with nothing new skips it and makes no LLM calls.
+
+- **Consolidated Feedback:** what's new since the last update, an executive summary, then each programming type (most recent feedback first) with what's working, what to improve, and themes. Each theme has its citation count, a breakdown by year, when it was last mentioned, quotes, and every citation. A theme whose feedback stopped after a program change is labeled **likely resolved**. Then themes not tied to one programming type, feature requests and bugs, open questions, and an appendix of the citations used.
+- **Programs:** for each programming type, its current description, a dated history (including changes found by comparing sources from different years, which cite both sides), how to run it, and what the feedback said in each period. Workshops (and other types in `programming.per_session_types`) get a **By year** section with each session's content, guidance, and feedback.
+- **Citations sheet:** a **Citations** tab with every citation (removed ones included) and a **Records** tab with every record, filterable by year, programming type, or category.
+
+Every citation marker such as `[C-0042]` links to its Discord message or Drive file. Discord links open only for server members who can see the channel; Drive links follow each file's sharing settings.
+
+How synthesis works and what it costs:
+
+- It runs `llm.synthesis_model` once per programming type, once per year of sessions for per-session types, once for feedback not tied to a type, and once for the executive summary. A first call also merges duplicate programming type names (for example "Family" into "Families"); merges are saved in `_state/programming_types.json` so later extractions use the kept name.
+- Each section's answer is saved in `_state/synthesis.json`, and a section whose records haven't changed is reused, whoever runs it next. A run that adds one Discord message only re-synthesizes that message's programming type and the summary. The first full synthesis of about 3,000 records costs about $3 with Claude Opus 5.5 through the Batch API; `kb update --dry-run` shows the estimate.
+- The model cites records by ID only; citation markers, counts, year breakdowns, and quotes are added by code, so they always match the saved records.
+- **If synthesis or publishing fails,** the rest of the run (new records, cursors) is still saved, the error is reported, and the command exits with an error. `kb update --synthesize` tries the docs again. A single section that fails is shown from its last good version (or its feedback is listed ungrouped) and is retried next run.
+- To try a different synthesis model, change `llm.synthesis_model` and run `kb update --synthesize`: nothing is extracted again.
 
 **If a run fails,** nothing in `_state/` changes and the next run starts from the same place. Ctrl-C stops a run cleanly: requests already sent are finished, the rest aren't sent, and the lock is released (a second Ctrl-C waits until it is). If a run is killed hard (e.g. the laptop closes), its lock stays behind. If it's your own lock (same user and machine), `kb update --force-unlock` clears it right away. Someone else's lock can only be cleared once it's stale, after `state.lock_timeout_minutes` (default 60), so a teammate's run that's still going is never interrupted.

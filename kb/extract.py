@@ -106,7 +106,13 @@ def system_prompt(version: int = PROMPT_VERSION) -> str:
 
 
 class ProgrammingTypes:
-    """`_state/programming_types.json`: [{"name": "Night Market", "first_seen": "..."}]."""
+    """`_state/programming_types.json`: [{"name": "Night Market", "first_seen": "..."}].
+
+    Synthesis can find that two names mean the same programming type and merge them: the
+    alias gets `"merged_into": "<canonical name>"`. Records keep the name they were saved
+    with (synthesis maps aliases when it groups them), new records get the canonical name,
+    and the extraction prompt lists only canonical names.
+    """
 
     def __init__(self, rows: list[Any] | None = None) -> None:
         self.rows: list[dict[str, Any]] = [
@@ -125,31 +131,67 @@ class ProgrammingTypes:
 
     @property
     def names(self) -> list[str]:
+        """Every saved name, merged aliases included."""
         return [r["name"] for r in self.rows]
+
+    @property
+    def canonical_names(self) -> list[str]:
+        """The names to offer the model: every name not merged into another."""
+        return [r["name"] for r in self.rows if not r.get("merged_into")]
+
+    @property
+    def merges(self) -> dict[str, str]:
+        """alias → canonical name, for every merged alias."""
+        return {r["name"]: self.canonical(r["name"]) for r in self.rows if r.get("merged_into")}
 
     @staticmethod
     def _norm(name: str) -> str:
         return " ".join(name.lower().split())
 
+    def _row(self, name: str) -> dict[str, Any] | None:
+        for row in self.rows:
+            if self._norm(row["name"]) == self._norm(name):
+                return row
+        return None
+
+    def canonical(self, name: str | None) -> str | None:
+        """Follow `merged_into` from a saved name (loops are cut short)."""
+        seen: set[str] = set()
+        while name is not None:
+            row = self._row(name)
+            if row is None or not row.get("merged_into") or row["name"] in seen:
+                return row["name"] if row else name
+            seen.add(row["name"])
+            name = row["merged_into"]
+        return name
+
     def resolve(self, name: str | None) -> str | None:
-        """The saved spelling of a name (case and spacing ignored), else the name tidied
-        (an all-lowercase new name is put in Title Case)."""
+        """The saved spelling of a name (case and spacing ignored), following merges; else
+        the name tidied (an all-lowercase new name is put in Title Case)."""
         if name is None:
             return None
         name = " ".join(name.split())
         if not name:
             return None
-        for existing in self.names:
-            if self._norm(existing) == self._norm(name):
-                return existing
+        if self._row(name) is not None:
+            return self.canonical(name)
         return string.capwords(name) if name == name.lower() else name
 
     def add(self, name: str, now: str) -> bool:
         """Add a new type. Returns True if it wasn't already saved."""
-        if self.resolve(name) in self.names:
+        if self._row(name) is not None:
             return False
         self.rows.append({"name": name, "first_seen": now})
         return True
+
+    def set_merges(self, merges: dict[str, str]) -> None:
+        """Replace every saved merge with `merges` (alias → canonical)."""
+        for row in self.rows:
+            target = merges.get(row["name"])
+            if target:
+                row["merged_into"] = target
+            else:
+                row.pop("merged_into", None)
 
 
 def _norm(name: str) -> str:
@@ -659,7 +701,7 @@ def run(
 ) -> ExtractResult:
     result = ExtractResult(usage=llm_mod.Usage(model=cfg.llm_extract_model))
     system = system_prompt()
-    types_now = store.types.names
+    types_now = store.types.canonical_names
 
     todo: list[Item] = []
     for item in items:
@@ -843,11 +885,19 @@ def status_lines(
     if types.rows:
         per: dict[str, int] = {}
         for r in rows:
-            if r.get("programming_type"):
-                per[r["programming_type"]] = per.get(r["programming_type"], 0) + 1
-        out.append(f"Programming types: {len(types.rows)}")
-        for name in sorted(types.names, key=lambda n: (-per.get(n, 0), n.lower())):
+            name = types.canonical(r.get("programming_type"))
+            if name:
+                per[name] = per.get(name, 0) + 1
+        merged = types.merges
+        out.append(
+            f"Programming types: {len(types.canonical_names)}"
+            + (f" ({len(merged)} more merged into these by synthesis)" if merged else "")
+        )
+        for name in sorted(types.canonical_names, key=lambda n: (-per.get(n, 0), n.lower())):
             line = f"  - {name}: {per.get(name, 0)} records"
+            aliases = sorted(a for a, c in merged.items() if c == name)
+            if aliases:
+                line += f" (includes {', '.join(aliases)})"
             named = [
                 s for s in (sessions.rows if sessions else []) if s["programming_type"] == name
             ]

@@ -46,7 +46,9 @@ from typing import Any, Protocol
 
 from kb import extract as ext
 from kb import llm as llm_mod
+from kb import publish as pub_mod
 from kb import state as st
+from kb import synthesize as synth
 from kb.citations import Citations
 from kb.config import Config
 from kb.progress import Stages
@@ -76,6 +78,8 @@ class Sources:
     drive_export: Callable[[dict[str, Any]], str]  # must be thread-safe (export_files)
     kb_folder: st.RemoteFolder
     llm: llm_mod.LLM | None = None  # None: no extraction possible (e.g. a dry run)
+    synth_llm: llm_mod.LLM | None = None  # None: no synthesis possible
+    publisher: pub_mod.Publisher | None = None  # None: nothing can be published
 
     @classmethod
     def real(cls, cfg: Config, log: Log) -> Sources:
@@ -83,6 +87,7 @@ class Sources:
         services = gdrive.Services.from_credentials(creds)
         cache = dsc.MemberCache(cfg.data_dir / MEMBER_CACHE)
         client: llm_mod.LLM | None = None
+        synth_client: llm_mod.LLM | None = None
         if cfg.anthropic_api_key:
             client = llm_mod.CachedLLM(
                 llm_mod.AnthropicLLM(
@@ -93,6 +98,16 @@ class Sources:
                     pending_batch_path=cfg.data_dir / "cache" / "pending_batch.json",
                 ),
                 cfg.data_dir / "cache" / "extract",
+            )
+            synth_client = llm_mod.CachedLLM(
+                llm_mod.AnthropicLLM(
+                    cfg.anthropic_api_key,
+                    cfg.llm_synthesis_model,
+                    effort=cfg.llm_synthesis_effort,
+                    batch_min_requests=cfg.llm_batch_min_requests,
+                    pending_batch_path=cfg.data_dir / "cache" / "pending_synth_batch.json",
+                ),
+                cfg.data_dir / "cache" / "synthesize",
             )
 
         def discord_fetch(cursors: dict[str, Any] | None, refresh: bool) -> dsc.DiscordPull:
@@ -123,6 +138,8 @@ class Sources:
             drive_export=gdrive.threaded_export(lambda: gdrive.Services.from_credentials(creds)),
             kb_folder=st.DriveFolder(services.drive, cfg.drive_kb_folder_id),
             llm=client,
+            synth_llm=synth_client,
+            publisher=pub_mod.DrivePublisher(creds, cfg.drive_kb_folder_id),
         )
 
 
@@ -587,6 +604,11 @@ class RunResult:
     items: list[ext.Item] = field(default_factory=list)  # extracted now, then waiting ones
     deferred: dict[str, str] = field(default_factory=dict)  # item ID → why it waits
     waiting: Waiting | None = None  # set by `--extract` runs
+    synth_plan: synth.Plan | None = None  # dry run: what synthesis would do
+    synthesis: synth.Synthesis | None = None
+    published: pub_mod.PublishResult | None = None
+    synth_skipped: str | None = None  # why synthesis didn't run
+    synth_error: str | None = None  # synthesis or publishing failed (state is still saved)
 
 
 def _plural(n: int, word: str, plural: str | None = None) -> str:
@@ -647,7 +669,7 @@ def build_items(
     return items
 
 
-STEPS = ("pull", "extract")  # M4 adds "synthesize"
+STEPS = ("pull", "extract", "synthesize")
 SOURCES = ("discord", "drive")
 
 
@@ -801,6 +823,7 @@ def run_update(
     limit: int | None = None,
     read: Iterable[str] = SOURCES,
     force_unlock: bool = False,
+    force_synthesize: bool = False,
     log: Log = print,
     sources: Sources | None = None,
     clock: Callable[[], datetime] | None = None,
@@ -813,6 +836,11 @@ def run_update(
     `read` picks the sources (`discord`, `drive`): only those are read, and only their
     items are extracted. The Drive cursor (`last_run_started_at`) moves only when Drive
     is read, so a Discord-only run doesn't hide Drive edits from the next run.
+
+    `synthesize` rebuilds and publishes the docs, but only when something they're built
+    from changed since the last publish (or nothing has been published yet), unless
+    `force_synthesize`. If synthesis or publishing fails, the error is reported in the
+    result and the rest of the run's state is still saved.
     """
     steps = set(steps)
     unknown = steps - set(STEPS)
@@ -823,7 +851,8 @@ def run_update(
         raise ValueError(f"read must be some of {', '.join(SOURCES)}, got {sorted(read)}")
     read_discord, read_drive = "discord" in read, "drive" in read
     pulling, extracting = "pull" in steps, "extract" in steps
-    stages = Stages(log, total=9 if sources is None else 8)
+    synthesizing = "synthesize" in steps
+    stages = Stages(log, total=11 if sources is None else 10)
     flags = [
         "--full" if full else "",
         "" if steps == set(STEPS) else " ".join(f"--{x}" for x in STEPS if x in steps),
@@ -856,6 +885,7 @@ def run_update(
             names = st.download(state_folder, local_state)
             state = st.State(local_state).load()
             store = load_store(local_state)
+            store.citations.apply_author_rule()
             last = state.run_log[-1] if state.run_log else None
             if not names:
                 s.result = "no saved state yet: this run reads everything"
@@ -895,6 +925,10 @@ def run_update(
                 read_drive=read_drive,
             )
             items = build_items(discord, retried, drive, files_by_id)
+        elif not extracting:
+            for title in ("Reading Discord", "Listing Drive files", "Loading items"):
+                stages.skip(title, "--synthesize only")
+            items = []
         else:
             stages.skip("Reading Discord", "--extract only")
             stages.skip("Listing Drive files", "--extract only")
@@ -919,7 +953,7 @@ def run_update(
 
         if not extracting:
             items, later = [], items
-            why = "--pull only"
+            why = "--pull only" if pulling else "--synthesize only"
         else:
             items, later = pick(items, limit)  # --extract: waiting_items already picked
             why = f"--limit {limit}"
@@ -936,12 +970,17 @@ def run_update(
             stages.skip("Saving raw snapshots", "dry run")
             if not no_extract:
                 with stages.stage("Estimating extraction size and cost (no LLM calls)") as s:
-                    result.estimate = ext.estimate(items, store.types.names, cfg)
+                    result.estimate = ext.estimate(items, store.types.canonical_names, cfg)
                     s.result = estimate_line(result.estimate, cfg)
                     if later_ids:
                         s.result += f"; {len(later_ids)} more wait ({why})"
             else:
                 stages.skip("Estimating extraction size and cost", no_extract)
+            if synthesizing:
+                _synth_dry_run(cfg, store, result, stages, started_at, force_synthesize)
+            else:
+                stages.skip("Estimating synthesis", "not part of this run")
+            stages.skip("Publishing", "dry run")
             stages.skip("Saving state to Drive", "dry run")
             return result
 
@@ -951,15 +990,16 @@ def run_update(
                     cfg, sources.kb_folder, run, discord, drive, files_by_id, s.detail
                 )
         else:
-            stages.skip("Saving raw snapshots", "--extract only")
+            stages.skip(
+                "Saving raw snapshots", "--extract only" if extracting else "--synthesize only"
+            )
 
         if no_extract:
-            stages.skip(
-                "Extracting records", f"{no_extract}; {_plural(len(later_ids), 'item')} wait"
-            )
+            waits = f"; {_plural(len(later_ids), 'item')} wait" if later_ids else ""
+            stages.skip("Extracting records", f"{no_extract}{waits}")
             result.extracted = ext.ExtractResult(usage=llm_mod.Usage(model=cfg.llm_extract_model))
         elif not items:
-            stages.skip("Extracting records", "nothing new")
+            stages.skip("Extracting records", "nothing waiting" if not pulling else "nothing new")
             result.extracted = ext.ExtractResult(usage=llm_mod.Usage(model=cfg.llm_extract_model))
         else:
             title = f"Extracting records from {_plural(len(items), 'item')}"
@@ -975,21 +1015,42 @@ def run_update(
                 )
         result.extracted.deferred.update(result.deferred)
 
-        # (M4: synthesis and publish go here.)
+        # Citation changes first, so synthesis sees removed sources and renamed files.
+        if pull is not None:
+            ext.mark_removed(
+                store.citations, message_ids=[d["message_id"] for d in discord.deleted]
+            )
+        if pulling and read_drive:
+            for f in drive.skipped:
+                entry = state.manifest.get(f"drive:{f['id']}")
+                if entry is not None:
+                    store.citations.refresh_drive({**entry, **gdrive.file_metadata(f)})
+            ext.mark_removed(store.citations, drive_ids=drive.removed)
+
+        synth_state = synth.SynthState.load(local_state / st.SYNTHESIS)
+        if synthesizing:
+            _synthesize(
+                cfg,
+                store,
+                synth_state,
+                sources,
+                stages,
+                result,
+                started_at,
+                lock.holder,
+                force_synthesize,
+            )
+        else:
+            stages.skip("Synthesizing the docs", "not part of this run")
+            stages.skip("Publishing", "not part of this run")
 
         with stages.stage("Saving state to Drive") as s:
             cursors_before = dict(state.cursors)
             tokens = {i.id: i.tokens for i in result.items}
             if pull is not None:  # Discord was read
                 apply_discord(state, pull, discord, started_at, result.extracted, retried)
-                ext.mark_removed(
-                    store.citations, message_ids=[d["message_id"] for d in discord.deleted]
-                )
             if pulling and read_drive:
                 apply_drive(state, drive, started_at, result.extracted, tokens)
-                for f in drive.skipped:
-                    store.citations.refresh_drive(state.manifest[f"drive:{f['id']}"])
-                ext.mark_removed(store.citations, drive_ids=drive.removed)
                 state.cursors["last_run_started_at"] = started_at  # Drive's cursor
             if waiting is not None:
                 apply_waiting(state, waiting, result.extracted, started_at)
@@ -1002,12 +1063,129 @@ def run_update(
             state.run_log.append(run)
             state.save()
             save_store(store, local_state)
+            synth_state.save(local_state / st.SYNTHESIS)
             uploaded = st.upload(state_folder, local_state)
             s.result = f"uploaded {', '.join(uploaded)}"
         return result
     finally:
         _release(lock, log)
         log(f"Finished in {stages.elapsed():.1f}s.")
+
+
+def _synth_needed(
+    cfg: Config, store: ext.Store, saved: synth.SynthState, force: bool
+) -> str | None:
+    """Why synthesis can be skipped this run, or None if it should run."""
+    if not store.records.rows:
+        return "no records yet"
+    if force:
+        return None
+    if len(saved.docs) < len(pub_mod.FILES):
+        return None  # nothing published yet
+    if synth.fingerprint(store.records, store.citations, store.types, cfg) != saved.fingerprint:
+        return None
+    when = (saved.last_published_at or "?")[:10]
+    return f"nothing changed since the last publish ({when}); --synthesize rebuilds anyway"
+
+
+def _synth_dry_run(
+    cfg: Config,
+    store: ext.Store,
+    result: RunResult,
+    stages: Stages,
+    started_at: str,
+    force: bool,
+) -> None:
+    saved = synth.SynthState.load(cfg.data_dir / "state" / st.SYNTHESIS)
+    skip = _synth_needed(cfg, store, saved, force)
+    if result.items and skip and skip != "no records yet":
+        skip = None  # extraction would add records
+    if skip:
+        result.synth_skipped = skip
+        stages.skip("Estimating synthesis", skip)
+        return
+    with stages.stage("Estimating synthesis size and cost (no LLM calls)") as s:
+        p = synth.plan(
+            store.records,
+            store.citations,
+            store.types,
+            store.sessions,
+            saved,
+            cfg,
+            int(started_at[:4]),
+        )
+        result.synth_plan = p
+        s.result = (
+            f"{_plural(len(p.todo), 'section')} of {len(p.units) + 1} to synthesize from the "
+            f"records saved so far, plus the executive summary: about {p.input_tokens:,} "
+            f"input and {p.output_tokens:,} output tokens, estimated cost "
+            f"{llm_mod.format_cost(p.cost_usd)} with {cfg.llm_synthesis_model}"
+        )
+        if result.items:
+            s.result += " (records from this run's extraction would add to this)"
+
+
+def _synthesize(
+    cfg: Config,
+    store: ext.Store,
+    saved: synth.SynthState,
+    sources: Sources,
+    stages: Stages,
+    result: RunResult,
+    started_at: str,
+    holder: str,
+    force: bool,
+) -> None:
+    """Synthesize and publish. Failures are recorded in `result`, not raised, so the rest
+    of the run (extracted records, cursors) is still saved."""
+    skip = _synth_needed(cfg, store, saved, force)
+    if skip:
+        result.synth_skipped = skip
+        stages.skip("Synthesizing the docs", skip)
+        stages.skip("Publishing", skip)
+        return
+    publishing = False
+    try:
+        with stages.stage(
+            f"Synthesizing the docs from {_plural(len(store.records.rows), 'record')}"
+        ) as s:
+            syn = synth.run(
+                store.records,
+                store.citations,
+                store.types,
+                store.sessions,
+                saved,
+                sources.synth_llm,
+                cfg,
+                int(started_at[:4]),
+                s.detail,
+            )
+            result.synthesis = syn
+            s.result = (
+                f"{len(syn.called)} sections synthesized, {len(syn.reused)} unchanged and "
+                f"reused, {_plural(len(syn.failed), 'failure')}; {syn.usage.line()}"
+            )
+        if sources.publisher is None:
+            raise RuntimeError("Publishing needs Google access (no publisher configured).")
+        publishing = True
+        with stages.stage("Publishing the docs and Citations sheet") as s:
+            published = pub_mod.publish(
+                syn, store, saved, sources.publisher, now=started_at, by=holder, log=s.detail
+            )
+            result.published = published
+            saved.fingerprint = synth.fingerprint(store.records, store.citations, store.types, cfg)
+            saved.last_published_at = started_at
+            saved.published_by = holder
+            for w in published.warnings:
+                s.detail(f"warning: {w}")
+            urls = published.urls()
+            s.result = f"{pub_mod.FEEDBACK_NAME}: {urls['feedback']}"
+            s.detail(f"{pub_mod.PROGRAMS_NAME}: {urls['programs']}")
+            s.detail(f"{pub_mod.SHEET_NAME}: {urls['citations']}")
+    except Exception as e:  # reported; the rest of the run is still saved
+        result.synth_error = f"{type(e).__name__}: {e}"
+        if not publishing:
+            stages.skip("Publishing", "synthesis failed")
 
 
 def _pull(
@@ -1221,6 +1399,29 @@ def summarize(r: RunResult) -> dict[str, Any]:
             "cost_usd": None if e.cost_usd is None else round(e.cost_usd, 4),
             "skipped": len(e.skipped),
         }
+    if r.synth_plan is not None:
+        p = r.synth_plan
+        out["synthesis_estimate"] = {
+            "units": len(p.todo),
+            "input_tokens": p.input_tokens,
+            "output_tokens": p.output_tokens,
+            "cost_usd": None if p.cost_usd is None else round(p.cost_usd, 4),
+        }
+    if r.synthesis is not None:
+        syn = r.synthesis
+        out["synthesis"] = {
+            "units_called": len(syn.called),
+            "units_reused": len(syn.reused),
+            "units_failed": syn.failed,
+            "merged_types": len(syn.merges),
+            "usage": syn.usage.to_dict(),
+        }
+    if r.published is not None:
+        out["published"] = {"ids": r.published.ids, "created": r.published.created}
+    if r.synth_skipped:
+        out["synthesis_skipped"] = r.synth_skipped
+    if r.synth_error:
+        out["synthesis_error"] = r.synth_error
     return out
 
 
@@ -1320,6 +1521,44 @@ def report(r: RunResult, manifest: dict[str, dict[str, Any]], log: Log, limit: i
         dropped = [f"{titles.get(k, k)}: {p}" for k, ps in x.problems.items() for p in ps]
         listing("  Record problems:", dropped)
         log(f"Tokens and cost: {x.usage.line()}")
+    if r.synth_plan is not None:
+        p = r.synth_plan
+        log(
+            f"Synthesis estimate: {_plural(len(p.todo), 'section')} to synthesize "
+            f"({len(p.units) + 1 - len(p.todo)} unchanged), about {p.input_tokens:,} input "
+            f"and {p.output_tokens:,} output tokens, cost {llm_mod.format_cost(p.cost_usd)}"
+        )
+        listing("  To synthesize:", [u.key for u in p.todo])
+    if r.synthesis is not None:
+        syn = r.synthesis
+        log(
+            f"Synthesis: {len(syn.called)} sections synthesized, {len(syn.reused)} unchanged "
+            f"and reused, {_plural(len(syn.failed), 'failure')}"
+        )
+        if syn.merges:
+            log(f"  Programming type names merged: {len(syn.merges)}")
+            listing("  Merged:", [f"{a} → {c}" for a, c in sorted(syn.merges.items())])
+        listing(
+            "  Failed (shown from the last good version, or as saved; tried again next run):",
+            [f"{k}: {v}" for k, v in syn.failed.items()],
+        )
+        problems = [f"{k}: {p}" for k, ps in syn.problems.items() for p in ps]
+        listing("  Answer problems (fixed or dropped):", problems)
+        log(f"  Tokens and cost: {syn.usage.line()}")
+    if r.published is not None:
+        urls = r.published.urls()
+        log("Published:")
+        log(f"  {pub_mod.FEEDBACK_NAME}: {urls['feedback']}")
+        log(f"  {pub_mod.PROGRAMS_NAME}: {urls['programs']}")
+        log(f"  {pub_mod.SHEET_NAME} sheet: {urls['citations']}")
+        if r.published.created:
+            log(f"  Created this run: {', '.join(r.published.created)}")
+        for w in r.published.warnings:
+            log(f"  Warning: {w}")
+    elif r.synth_skipped and not r.dry_run:
+        log(f"Docs: not rebuilt ({r.synth_skipped})")
+    if r.synth_error:
+        log(f"Synthesis or publishing failed: {r.synth_error}")
     if r.deferred:
         why = next(iter(r.deferred.values()))
         log(
@@ -1426,6 +1665,21 @@ def status_lines(state: st.State, lock: dict[str, Any] | None) -> list[str]:
 
     store = load_store(state.dir)
     out.extend(ext.status_lines(store.records, store.citations, store.types, store.sessions))
+    saved = synth.SynthState.load(state.dir / st.SYNTHESIS)
+    if saved.last_published_at:
+        out.append(f"Docs: last published {saved.last_published_at} by {saved.published_by or '?'}")
+        names = {"feedback": pub_mod.FEEDBACK_NAME, "programs": pub_mod.PROGRAMS_NAME}
+        for key, fid in saved.docs.items():
+            if key == "citations":
+                out.append(
+                    f"  {pub_mod.SHEET_NAME} sheet: https://docs.google.com/spreadsheets/d/{fid}/edit"
+                )
+            else:
+                out.append(
+                    f"  {names.get(key, key)}: https://docs.google.com/document/d/{fid}/edit"
+                )
+    else:
+        out.append("Docs: not published yet")
     return out
 
 

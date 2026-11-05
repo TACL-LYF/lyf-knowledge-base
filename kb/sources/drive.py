@@ -27,7 +27,7 @@ from kb.config import DEFAULT_EXPORT_WORKERS
 
 SCOPES = [
     "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/documents.readonly",
+    "https://www.googleapis.com/auth/documents",  # write: fixing heading links in the docs
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/presentations.readonly",
 ]
@@ -517,6 +517,7 @@ def file_metadata(f: dict[str, Any]) -> dict[str, Any]:
         "link": f.get("webViewLink") or f"https://drive.google.com/open?id={f['id']}",
         # Files in a Shared Drive have no owner; fall back to the last person to edit.
         "owner": ", ".join(owners) or f.get("lastModifyingUser", {}).get("displayName"),
+        "owner_is_editor": not owners,  # no owner known: `owner` is the last editor
         "modified_time": f.get("modifiedTime"),
     }
 
