@@ -6,9 +6,10 @@ One run:
 2. Discord: read past the cursors (or everything with `--full`), and keep only messages
    not seen before. Earlier messages in the same thread are kept as context.
 3. Drive: list every file in the source folders (recursively) and compare to the
-   manifest: new / changed / skip / removed. New and changed files are exported, and a
-   change that leaves the text the same (e.g. a comment) is skipped by content hash.
-4. Save raw snapshots locally in `data/raw/` (never uploaded, to keep Drive storage small).
+   manifest: new / changed / skip / removed. New and changed files are exported (with
+   `--full`, every file is), and a change that leaves the text the same (e.g. a comment)
+   is skipped by content hash.
+4. Save raw snapshots in `data/raw/` and upload them to `raw/` in the Knowledge Base folder.
 5. Update the manifest, cursors and run log, upload `_state/`, release the lock.
 
 State is uploaded only at step 5, so a run that fails earlier changes nothing and the
@@ -217,7 +218,14 @@ def classify_drive(
     files: list[dict[str, Any]],
     manifest: dict[str, dict[str, Any]],
     last_run_started_at: str | None,
+    full: bool = False,
 ) -> DriveChanges:
+    """Sort listed files into new / modified / skipped, and find removed ones.
+
+    With `full`, every known file counts as modified, so it's exported again. That way a
+    change to an exporter reaches files that haven't been edited; files whose text comes
+    out the same are still skipped by content hash.
+    """
     since = st.parse_time(last_run_started_at)
     out = DriveChanges()
     listed = set()
@@ -229,7 +237,13 @@ def classify_drive(
             out.new.append(f)
             continue
         modified = st.parse_time(f.get("modifiedTime"))
-        if entry.get("status") == "error" or since is None or modified is None or modified > since:
+        if (
+            full
+            or entry.get("status") == "error"
+            or since is None
+            or modified is None
+            or modified > since
+        ):
             out.modified.append(f)
         else:
             out.skipped.append(f)
@@ -303,24 +317,35 @@ def apply_drive(state: st.State, changes: DriveChanges, now: str) -> None:
 
 def save_raw(
     cfg: Config,
+    kb_folder: st.RemoteFolder,
     run: dict[str, Any],
     discord: DiscordChanges,
     drive: DriveChanges,
     files_by_id: dict[str, dict[str, Any]],
+    log: Log = lambda _: None,
 ) -> str:
-    """Write this run's new content to data/raw/ (local only; nothing is uploaded).
+    """Write this run's new content to data/raw/ and upload it to raw/ in the KB folder.
 
     Returns a one-line summary of what was written.
 
-    Discord: one file per day, `discord/YYYY-MM-DD.json`, holding every run that day.
-    Drive: `drive/<fileId>.md`, the latest export of each new or changed file.
+    Discord: one file per day, `discord/YYYY-MM-DD.json`, holding every run that day (by
+    anyone: the copy in Drive is read first, so teammates' runs aren't overwritten).
+    Drive: `drive/<fileId>.md`, the latest export of each new or changed file. With
+    `--full`, every exported file is written, so `raw/drive/` is filled in completely.
     """
     raw_dir = cfg.data_dir / "raw"
+    remote_raw = kb_folder.subfolder(st.RAW_FOLDER)
+    assert remote_raw is not None  # created on demand
 
     if discord.items or discord.deleted:
         local = raw_dir / "discord" / f"{run['started_at'][:10]}.json"
+        remote_discord = remote_raw.subfolder("discord")
+        assert remote_discord is not None
         day: dict[str, Any] = {"date": run["started_at"][:10], "runs": []}
-        if local.is_file():
+        existing = remote_discord.read(local.name)
+        if existing is not None:
+            day = json.loads(existing)
+        elif local.is_file():
             day = json.loads(local.read_text(encoding="utf-8"))
         day["runs"].append(
             {
@@ -335,21 +360,29 @@ def save_raw(
         local.parent.mkdir(parents=True, exist_ok=True)
         text = json.dumps(day, indent=2, ensure_ascii=False) + "\n"
         local.write_text(text, encoding="utf-8")
+        remote_discord.write(local.name, text.encode("utf-8"))
 
     unchanged = {f["id"] for f in drive.unchanged}
-    to_write = [fid for fid in drive.exported if fid not in unchanged]
+    to_write = [fid for fid in drive.exported if run["full"] or fid not in unchanged]
     if to_write:
         (raw_dir / "drive").mkdir(parents=True, exist_ok=True)
-        for fid in to_write:
+        remote_drive = remote_raw.subfolder("drive")
+        assert remote_drive is not None
+        for n, fid in enumerate(to_write, 1):
             text = gdrive.render_file(files_by_id[fid], drive.exported[fid])
             (raw_dir / "drive" / f"{fid}.md").write_text(text, encoding="utf-8")
+            remote_drive.write(f"{fid}.md", text.encode("utf-8"), mime="text/markdown")
+            if n % 25 == 0 and n < len(to_write):
+                log(f"uploaded {n}/{len(to_write)} Drive exports")
 
     parts = []
     if discord.items or discord.deleted:
         parts.append(f"discord/{local.name} ({_plural(len(discord.items), 'item')})")
     if to_write:
         parts.append(f"drive/ ({_plural(len(to_write), 'file')})")
-    return f"wrote {' and '.join(parts)} in {raw_dir}" if parts else "nothing new to write"
+    if not parts:
+        return "nothing new to write"
+    return f"wrote {' and '.join(parts)} to {raw_dir} and raw/ in Drive"
 
 
 # ---------------------------------------------------------------------------
@@ -450,7 +483,9 @@ def run_update(
 
         with stages.stage("Listing Drive files and comparing to the manifest") as s:
             files = sources.drive_list()
-            drive = classify_drive(files, state.manifest, state.cursors.get("last_run_started_at"))
+            drive = classify_drive(
+                files, state.manifest, state.cursors.get("last_run_started_at"), full=full
+            )
             s.result = (
                 f"{_plural(len(files), 'file')}: {len(drive.new)} new, "
                 f"{len(drive.modified)} modified since the last run, "
@@ -477,8 +512,10 @@ def run_update(
             stages.skip("Saving state to Drive", "dry run")
             return result
 
-        with stages.stage("Saving raw snapshots locally") as s:
-            s.result = save_raw(cfg, run, discord, drive, {f["id"]: f for f in files})
+        with stages.stage("Saving raw snapshots locally and in Drive") as s:
+            s.result = save_raw(
+                cfg, sources.kb_folder, run, discord, drive, {f["id"]: f for f in files}, s.detail
+            )
 
         # (M3: extraction goes here. M4: synthesis and publish.)
 

@@ -387,12 +387,46 @@ def test_first_dry_run_creates_nothing_in_drive(tmp_path):
     assert upd.status(w.cfg, kb_folder=w.kb)[0] == "Last run: none yet"
 
 
-def test_raw_snapshots_are_never_uploaded(world):
+def test_raw_snapshots_are_uploaded_to_drive(world):
+    raw = world.kb.subfolder(st.RAW_FOLDER)
+    assert raw.subfolder("drive").read("a.md") is not None  # from the first run
     world.discord.channel.append(msg(95))
     world.drive.add("a", "edited", world.now - timedelta(minutes=5))
     world.run()
-    assert set(world.kb.folders) == {st.STATE_FOLDER}
+    assert set(world.kb.folders) == {st.STATE_FOLDER, st.RAW_FOLDER}
     assert world.kb.files == []
+    assert "edited" in raw.subfolder("drive").read("a.md").decode()
+    local = (world.cfg.data_dir / "raw" / "drive" / "a.md").read_text()
+    assert raw.subfolder("drive").read("a.md").decode() == local
+    day = json.loads(raw.subfolder("discord").read("2026-11-01.json"))
+    assert [i["id"] for i in day["runs"][-1]["items"]] == ["discord-msg:95"]
+
+
+def test_raw_discord_day_keeps_teammates_runs_from_drive(world):
+    remote = world.kb.subfolder(st.RAW_FOLDER).subfolder("discord")
+    day = json.loads(remote.read("2026-11-01.json"))
+    day["runs"].append({"run_id": "teammate", "items": []})
+    remote.write("2026-11-01.json", json.dumps(day).encode())
+    (world.cfg.data_dir / "raw" / "discord" / "2026-11-01.json").unlink()  # other machine
+    world.discord.channel.append(msg(97))
+    world.run()
+    runs = json.loads(remote.read("2026-11-01.json"))["runs"]
+    assert [r["run_id"] for r in runs][1] == "teammate" and len(runs) == 3
+
+
+def test_full_exports_every_drive_file_again(world):
+    world.drive.bodies["b"] = "body b, exported differently"  # e.g. an exporter change
+    r = world.run(full=True)
+    assert sorted(world.drive.exports) == ["a", "b"]
+    assert [f["id"] for f in r.drive.changed] == ["b"]
+    assert [f["id"] for f in r.drive.unchanged] == ["a"]
+    m = world.state()["manifest"]
+    assert m["drive:b"]["content_hash"] == upd.content_hash("body b, exported differently")
+    drive_raw = world.kb.subfolder(st.RAW_FOLDER).subfolder("drive")
+    assert {f["name"] for f in drive_raw.files} == {"a.md", "b.md"}
+    # A normal run afterwards doesn't export anything.
+    world.run()
+    assert world.drive.exports == []
 
 
 def test_progress_shows_each_stage_and_its_result(world):

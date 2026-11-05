@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 STATE_FOLDER = "_state"
+RAW_FOLDER = "raw"  # raw snapshots, next to _state/ in the Knowledge Base folder
 LOCK_NAME = "lock"
 
 CURSORS = "cursors.json"

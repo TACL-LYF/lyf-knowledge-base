@@ -218,13 +218,13 @@ The pipeline keeps local copies of everything it fetches in `data/`, so you can 
 ```
 data/
 ├── raw/discord/    # fetched messages, per run (+ members.json, cached nicknames)
-├── raw/drive/      # exported text of Drive files
+├── raw/drive/      # exported text of Drive files (embedded images replaced by [image])
 └── state/          # local copy of the _state/ folder from Drive
 ```
 
 - `data/` is in `.gitignore` and is **never committed**. It contains other people's messages and documents.
 - **Drive is the source of truth for state.** Each run downloads `_state/` from Drive into `data/state/` and uploads it again at the end. Your local copy is only a cache.
-- **Raw copies stay local.** Fetched messages and exported file text are only saved in `data/raw/`, never uploaded to Drive, so they don't use up Drive storage.
+- **Raw copies are also saved in Drive.** `kb update` uploads the new messages and new or changed file exports to `raw/` in the Knowledge Base folder, so teammates can see what the model was given. Embedded images are removed from Doc exports, so all of it is only a few MB. `kb pull` stays local only.
 - You can delete `data/` at any time. The next run downloads state again, and raw files are fetched as needed.
 
 ## Running the pipeline
@@ -256,7 +256,7 @@ Looking up each author's server nickname takes one Discord API call per person, 
 kb update             # normal run: new Discord messages + new/changed Drive files
 kb update --dry-run   # show what's new, without saving anything (no lock, no Drive writes)
 kb status             # last run, lock, cursors, item counts, errors, programming types
-kb update --full      # rare: read the whole Discord channel again to find edited/deleted messages
+kb update --full      # rare: read the whole Discord channel and export every Drive file again
 kb rebuild            # rare: extract everything again (M3)
 ```
 
@@ -266,6 +266,8 @@ The first `kb update` reads everything, because there's no saved state yet. Afte
 - **Drive:** files not seen before (including old files moved into a source folder), and files modified since the last run started. If a modified file's text is the same (for example, only a comment was added), it's skipped.
 - **Removed Drive files** are marked `removed` in the manifest.
 
-As of M2, a run saves the new content locally (`data/raw/discord/YYYY-MM-DD.json`, `data/raw/drive/<fileId>.md`) and updates `_state/` in Drive. Raw content is never uploaded to Drive. Extraction (M3) and the doc (M4) will plug into the same run.
+As of M2, a run saves the new content locally (`data/raw/discord/YYYY-MM-DD.json`, `data/raw/drive/<fileId>.md`), uploads the same files to `raw/` in the Knowledge Base folder, and updates `_state/` in Drive. Extraction (M3) and the docs (M4) will plug into the same run.
+
+`--full` finds edited and deleted Discord messages, and exports every Drive file again even if it wasn't modified. Use it after a change to how files are exported, so the change reaches every file. Files whose text comes out the same are still skipped, so they aren't extracted again.
 
 **If a run fails,** nothing in `_state/` changes and the next run starts from the same place. If a run is killed hard (e.g. the laptop closes), its lock stays behind; after `state.lock_timeout_minutes` (default 60) it counts as stale and `kb update --force-unlock` clears it.

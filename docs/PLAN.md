@@ -316,7 +316,7 @@ lyf-knowledge-base/
 ```bash
 kb update             # read new Discord messages + new/changed Drive files → extract → rebuild doc
 kb update --dry-run   # show what's new or changed; no LLM calls, no writes
-kb update --full      # rare: read the whole Discord channel again to catch edited or deleted messages
+kb update --full      # rare: read the whole Discord channel and export every Drive file again
 kb status             # last run, cursors, item counts, recent errors, programming types with counts, records per year, share of source_date dates
 kb rebuild            # extract everything again (e.g., after a big prompt change)
 kb pull               # M1/debugging: full read of Discord + Drive into data/raw/ (local only)
@@ -381,10 +381,10 @@ Each milestone ends with something you can demo, and doesn't depend on later mil
 
 Before the first full run, cut the text sent to the LLM down to what matters. A check of the first 277 exported Drive files found 29.8 MB of text, but 27 MB of it was images embedded as base64 inside Docs exports (55 files). The largest file, "2026 Universal", was 7.6 MB, and 53 KB once images were removed. Without images the files total 2.8 MB (about 0.7M tokens), with a median of 5.7 KB and a largest file of 161 KB.
 
-- [ ] Docs exporter: remove embedded base64 images from Drive's markdown export (the `[imageN]: <data:...>` definitions), and replace each `![][imageN]` with `[image]` so the model knows an image was there. This happens in the exporter, before the text is saved or hashed, so replacing a picture in a Doc doesn't change its content hash or cause it to be extracted again. The images stay in the original Doc, which every citation links to
-- [ ] `kb update --full` exports every Drive file again, so the image removal reaches files already in the manifest. Run it once after the exporter change
-- [ ] Upload raw snapshots to `raw/` in the Knowledge Base folder again (new Discord messages per day, new or changed Drive exports), now that they're small
-- [ ] Separate models for the two steps in `config.yaml`: `llm.extract_model` (default `claude-opus-5-5`, run through the Batch API for large runs) and `llm.synthesis_model` (default `claude-opus-5-5`). See [Choosing models](#choosing-models)
+- [x] Docs exporter: remove embedded base64 images from Drive's markdown export (the `[imageN]: <data:...>` definitions), and replace each `![][imageN]` with `[image]` so the model knows an image was there. This happens in the exporter, before the text is saved or hashed, so replacing a picture in a Doc doesn't change its content hash or cause it to be extracted again. The images stay in the original Doc, which every citation links to
+- [x] `kb update --full` exports every Drive file again, so the image removal reaches files already in the manifest. Run it once after the exporter change
+- [x] Upload raw snapshots to `raw/` in the Knowledge Base folder again (new Discord messages per day, new or changed Drive exports), now that they're small
+- [x] Separate models for the two steps in `config.yaml`: `llm.extract_model` (default `claude-opus-5-5`, run through the Batch API for large runs) and `llm.synthesis_model` (default `claude-opus-5-5`). See [Choosing models](#choosing-models)
 - [ ] Size check: estimate tokens for each item (characters ÷ 4 is close enough) and show the per-item estimate, the total, and the estimated cost in `kb update --dry-run`. Items over `llm.max_item_tokens` in `config.yaml` (default 100,000) are given status `skipped` with the reason, and listed in the run summary and `kb status`, unless their file ID is in `drive.allow_large_files`
 - [ ] `citations.py`: permanent IDs; one citation per Discord message and one per Drive file; active/removed status
 - [ ] Extraction prompt (in `prompts/`, versioned) framed around community programming, with structured output. Each record has a `kind`:
