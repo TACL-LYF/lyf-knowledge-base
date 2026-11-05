@@ -7,6 +7,7 @@ from kb.sources.drive import (
     render_file,
     render_presentation,
     render_table,
+    strip_embedded_images,
 )
 
 
@@ -123,3 +124,31 @@ def test_listing_reads_subfolders_once_and_dedupes(monkeypatch):
     files = gdrive.list_folder_files(None, ["root", "other"], [gdrive.DOC_MIME, gdrive.SHEET_MIME])
     assert [f["id"] for f in files] == ["a", "b"]
     assert sorted(calls) == ["other", "root", "sub"]
+
+
+def test_strip_embedded_images_replaces_refs_and_drops_definitions():
+    md = (
+        "# Plan\n\n"
+        "Intro ![][image1] text.\n\n"
+        "![][image2]![][image2] ![][image3]\n\n"
+        "| Bone | ![logo][image3] |\n\n"
+        "Inline ![chart](data:image/jpeg;base64,/9j/AAAA) here.\n\n"
+        "Linked ![photo](https://example.com/p.png) and ![][remote] stay.\n\n"
+        "[image1]: <data:image/png;base64,iVBORw0KGgo=>\n\n"
+        "[image2]: <data:image/png;base64,AAAA>\n"
+        '[Image3]: <data:image/gif;base64,R0lGOD> "Screenshot 2026-07-01"\n'
+        "[remote]: https://example.com/r.png\n"
+    )
+    out = strip_embedded_images(md)
+    assert "data:" not in out
+    assert "Intro [image] text." in out
+    assert "\n[image]\n" in out  # a run of images collapses to one
+    assert "| Bone | [image: logo] |" in out
+    assert "Inline [image: chart] here." in out
+    assert "![photo](https://example.com/p.png)" in out
+    assert "![][remote]" in out and "[remote]: https://example.com/r.png" in out
+
+
+def test_strip_embedded_images_leaves_plain_text_unchanged():
+    md = "# Notes\n\nNo images here, just [a link](https://x.y) and [ref][1].\n\n[1]: https://x.y\n"
+    assert strip_embedded_images(md) == md
