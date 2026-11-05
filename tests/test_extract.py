@@ -1,6 +1,7 @@
 """Unit tests for extraction checks, citations, programming types, and the LLM client."""
 
 import json
+import time
 from types import SimpleNamespace as NS
 
 import pytest
@@ -404,3 +405,22 @@ def test_user_message_marks_per_session_types_and_lists_sessions():
     assert "- Night Market\n- Workshop (per-session)" in msg
     assert "- Workshop, 2025-03-14: Active Listening" in msg
     assert "(none yet)" in ext.user_message([], "src")
+
+
+def test_ctrl_c_during_direct_requests_does_not_send_the_queued_ones(monkeypatch):
+    sent = []
+
+    def direct(self, r):
+        sent.append(r.custom_id)
+        time.sleep(0.02)
+        return llm_mod.Response(r.custom_id, text="{}")
+
+    monkeypatch.setattr(llm_mod.AnthropicLLM, "_direct", direct)
+    model = llm_mod.AnthropicLLM("k", "claude-opus-5-5", client=FakeClient(), batch_min_requests=99)
+
+    def log(msg):  # stands in for Ctrl-C arriving mid-run
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        model.run(reqs(*map(str, range(40))), log)
+    assert len(sent) < 20  # only the running ones finished; the rest were never sent

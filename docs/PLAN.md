@@ -151,7 +151,7 @@ Knowledge Base/
     └── lock                       # prevents two runs at once
 ```
 
-At the start of a run, the script takes the lock and downloads `_state/` into `data/state/`. At the end, it uploads `_state/` and releases the lock. If a lock is older than a set timeout, it's treated as stale and can be cleared with `--force-unlock`.
+At the start of a run, the script takes the lock and downloads `_state/` into `data/state/`. At the end, it uploads `_state/` and releases the lock. If a lock is older than a set timeout, it's treated as stale and can be cleared with `--force-unlock`. Your own lock (same user and machine, e.g. left by an interrupted run) can be cleared with `--force-unlock` at any age.
 
 ### Local copies
 

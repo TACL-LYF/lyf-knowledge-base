@@ -23,8 +23,12 @@ from __future__ import annotations
 
 import getpass
 import json
+import signal
 import socket
+import threading
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -270,6 +274,26 @@ def read_lock(folder: RemoteFolder) -> dict[str, Any] | None:
         return {}
 
 
+@contextmanager
+def _no_interrupts() -> Iterator[None]:
+    """Hold off Ctrl-C (SIGINT) until the block ends; it's raised afterwards if pressed."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    pressed: list[Any] = []
+    try:
+        previous = signal.signal(signal.SIGINT, lambda *a: pressed.append(a))
+    except ValueError:  # signals unavailable here
+        yield
+        return
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+        if pressed and callable(previous):
+            previous(*pressed[0])
+
+
 class Lock:
     """The run lock: a `lock` file in `_state/`.
 
@@ -292,21 +316,33 @@ class Lock:
         self.run_id = uuid.uuid4().hex[:12]
         self._clock = clock or (lambda: datetime.now(UTC))
         self.file_id: str | None = None
+        self.cleared: str | None = None  # the lock --force-unlock cleared, if any
 
     def acquire(self, force_unlock: bool = False) -> None:
+        """Take the lock. `force_unlock` clears an existing lock first if it's stale, or if
+        it's ours (same user and machine), e.g. left by a run that was interrupted. A
+        fresh lock held by someone else is never cleared: their run may still be going."""
         now = self._clock()
         existing = [f for f in self.folder.list() if f["name"] == LOCK_NAME]
         if existing:
             info = read_lock(self.folder) or {}
             age = _lock_age(info, now)
             stale = age is None or age > self.timeout
+            ours = info.get("holder") == self.holder
             desc = f"held by {info.get('holder', 'unknown')} since {info.get('acquired_at', '?')}"
-            if not stale:
-                raise LockError(
-                    f"Another run is in progress ({desc}). Wait for it to finish. A lock "
-                    f"older than {int(self.timeout.total_seconds() // 60)} minutes counts as "
-                    "stale and can be cleared with --force-unlock."
-                )
+            minutes = int(self.timeout.total_seconds() // 60)
+            if not stale and not (force_unlock and ours):
+                if ours:
+                    hint = (
+                        "If no other run of yours is going (e.g. the last one was interrupted), "
+                        "clear it with --force-unlock."
+                    )
+                else:
+                    hint = (
+                        f"Wait for it to finish. A lock older than {minutes} minutes counts as "
+                        "stale and can be cleared with --force-unlock."
+                    )
+                raise LockError(f"Another run is in progress ({desc}). {hint}")
             if not force_unlock:
                 raise LockError(
                     f"A stale lock was found ({desc}); the run that took it probably "
@@ -314,6 +350,7 @@ class Lock:
                 )
             for f in existing:
                 self.folder.trash_id(f["id"])
+            self.cleared = desc
 
         info = {
             "holder": self.holder,
@@ -331,7 +368,11 @@ class Lock:
             raise LockError("Another run took the lock at the same moment. Try again.")
 
     def release(self) -> None:
-        if self.file_id is not None:
+        """Delete our lock file. Ctrl-C is held off until it's done (main thread only), so
+        an impatient second Ctrl-C can't leave the lock behind."""
+        if self.file_id is None:
+            return
+        with _no_interrupts():
             self.folder.trash_id(self.file_id)
             self.file_id = None
 

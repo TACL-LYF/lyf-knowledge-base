@@ -848,6 +848,8 @@ def run_update(
     else:
         with stages.stage("Taking the run lock") as s:
             lock.acquire(force_unlock=force_unlock)
+            if lock.cleared:
+                s.detail(f"cleared the old lock ({lock.cleared})")
             s.result = f"lock taken by {lock.holder} (run {lock.run_id})"
     try:
         with stages.stage("Downloading state from Drive") as s:
@@ -1175,7 +1177,7 @@ def _release(lock: st.Lock, log: Log) -> None:
         log(
             f"warning: the run lock couldn't be released ({type(e).__name__}: {e}). "
             "Everything above still applies. The next run will report the lock as held; "
-            "once it's stale, clear it with `kb update --force-unlock`."
+            "clear it with `kb update --force-unlock`."
         )
     else:
         log("Run lock released.")
@@ -1460,6 +1462,8 @@ def requeue(
         return 0
     lock = st.Lock(folder, cfg.lock_timeout_minutes, clock=clock)
     lock.acquire(force_unlock=force_unlock)
+    if lock.cleared:
+        print(f"Cleared the old lock ({lock.cleared}).")
     try:
         local = cfg.data_dir / "state"
         st.download(folder, local)

@@ -242,11 +242,16 @@ class AnthropicLLM:
 
     def _run_direct(self, requests: list[Request], log: Log) -> dict[str, Response]:
         out: dict[str, Response] = {}
-        with ThreadPoolExecutor(max_workers=DIRECT_CONCURRENCY) as pool:
+        pool = ThreadPoolExecutor(max_workers=DIRECT_CONCURRENCY)
+        try:
             for n, resp in enumerate(pool.map(self._direct, requests), 1):
                 out[resp.custom_id] = resp
                 if n % 10 == 0 and n < len(requests):
                     log(f"{n}/{len(requests)} requests answered")
+        finally:
+            # On Ctrl-C (or an error), don't send the requests still queued: only the
+            # ones already running are waited for, so the run can stop and release its lock.
+            pool.shutdown(wait=True, cancel_futures=True)
         return out
 
     # -- batch ---------------------------------------------------------------
