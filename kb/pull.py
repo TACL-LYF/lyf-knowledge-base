@@ -125,19 +125,30 @@ def pull_drive(
     cfg: Config,
     raw_dir: Path,
     log: Log,
-    services: gdrive.Services | None = None,
+    make_services: Callable[[], gdrive.Services] | None = None,
     stages: Stages | None = None,
 ) -> dict[str, Any]:
+    """Export every in-scope file. `make_services` builds API clients; it's called once
+    for listing and once per export thread (clients can't be shared between threads)."""
     stages = stages or Stages(log, total=3)
     with stages.stage("Connecting to Google Drive") as s:
-        if services is None:
-            services = gdrive.Services.from_key(cfg.google_credentials_path)
-            s.result = f"signed in as {gdrive.service_account_email(cfg.google_credentials_path)}"
+        if make_services is None:
+            creds = gdrive.credentials(cfg.google_credentials_path)
+            make_services = lambda: gdrive.Services.from_credentials(creds)  # noqa: E731
+            s.result = f"signed in as {creds.service_account_email}"
+        services = make_services()
 
     folders = cfg.drive_source_folder_ids
     with stages.stage(f"Listing files in {len(folders)} source folder(s), with subfolders") as s:
         files = list(
-            gdrive.list_folder_files(services.drive, folders, cfg.drive_file_types, s.detail)
+            gdrive.list_folder_files(
+                services.drive,
+                folders,
+                cfg.drive_file_types,
+                s.detail,
+                make_drive=lambda: make_services().drive,
+                workers=cfg.drive_export_workers,
+            )
         )
         counts: dict[str, int] = {}
         for f in files:
@@ -147,34 +158,42 @@ def pull_drive(
             " (" + ", ".join(f"{v} {k}" for k, v in sorted(counts.items())) + ")" if counts else ""
         )
 
-    with stages.stage(f"Exporting {len(files)} Drive files") as s:
+    workers = cfg.drive_export_workers
+    with stages.stage(f"Exporting {len(files)} Drive files ({workers} at a time)") as s:
         partial = _fresh_dir(raw_dir / ".drive.partial")
         listed, errors = [], []
         by_type: dict[str, int] = {}
         width = len(str(len(files)))
-        for n, f in enumerate(files, 1):
-            meta = gdrive.file_metadata(f)
-            label = f"({n:>{width}}/{len(files)}) {meta['title']}"
-            try:
-                body = gdrive.export_text(services, f)
-            except Exception as e:  # one bad file shouldn't stop the pull
-                msg = f"{type(e).__name__}: {e}"
-                errors.append(
-                    {"id": meta["id"], "title": meta["title"], "link": meta["link"], "error": msg}
-                )
-                s.detail(f"{label}: error: {msg}")
-            else:
-                (partial / f"{f['id']}.md").write_text(
-                    gdrive.render_file(f, body), encoding="utf-8"
-                )
-                by_type[meta["source"]] = by_type.get(meta["source"], 0) + 1
-                listed.append({**meta, "path": f"drive/{f['id']}.md"})
-                s.detail(f"{label}: ok")
+        export = gdrive.threaded_export(make_services)
+        with gdrive.RetryCounter() as retries:
+            results = gdrive.export_files(files, export, workers)
+            for n, r in enumerate(results, 1):
+                f = r.file
+                meta = gdrive.file_metadata(f)
+                label = f"({n:>{width}}/{len(files)}) {meta['title']}"
+                if r.error is not None:  # one bad file shouldn't stop the pull
+                    errors.append(
+                        {
+                            "id": meta["id"],
+                            "title": meta["title"],
+                            "link": meta["link"],
+                            "error": r.error,
+                        }
+                    )
+                    s.detail(f"{label}: error: {r.error}")
+                else:
+                    assert r.body is not None
+                    (partial / f"{f['id']}.md").write_text(
+                        gdrive.render_file(f, r.body), encoding="utf-8"
+                    )
+                    by_type[meta["source"]] = by_type.get(meta["source"], 0) + 1
+                    listed.append({**meta, "path": f"drive/{f['id']}.md"})
+                    s.detail(f"{label}: ok")
         _swap_in(partial, raw_dir / "drive")
         s.result = (
             f"{len(listed)} exported ("
             + ", ".join(f"{v} {k}" for k, v in sorted(by_type.items()))
-            + f"), {len(errors)} errors, written to {raw_dir / 'drive'}"
+            + f"), {len(errors)} errors{retries.summary()}, written to {raw_dir / 'drive'}"
         )
 
     return {"files": len(listed), "by_type": by_type, "items": listed, "errors": errors}

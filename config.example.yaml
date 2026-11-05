@@ -14,6 +14,7 @@ drive:
     - application/vnd.google-apps.spreadsheet
     - application/vnd.google-apps.presentation
   allow_large_files: [] # file IDs to extract even when over llm.max_item_tokens
+  export_workers: 8 # files exported (and folders listed) at once; 1 for one at a time
 
 llm: # see "Choosing models" in docs/PLAN.md
   extract_model: claude-opus-5-5 # turns each item into records; mistakes are saved for good

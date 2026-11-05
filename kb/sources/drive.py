@@ -10,15 +10,20 @@ Exporters (each returns markdown):
 
 from __future__ import annotations
 
+import logging
 import re
+import threading
 from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import yaml
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+
+from kb.config import DEFAULT_EXPORT_WORKERS
 
 SCOPES = [
     "https://www.googleapis.com/auth/drive",
@@ -26,6 +31,8 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/presentations.readonly",
 ]
+
+T = TypeVar("T")
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 DOC_MIME = "application/vnd.google-apps.document"
@@ -62,7 +69,10 @@ class Services:
 
     @classmethod
     def from_key(cls, key_path: Path) -> Services:
-        creds = credentials(key_path)
+        return cls.from_credentials(credentials(key_path))
+
+    @classmethod
+    def from_credentials(cls, creds: service_account.Credentials) -> Services:
         return cls(
             drive=build("drive", "v3", credentials=creds, cache_discovery=False),
             sheets=build("sheets", "v4", credentials=creds, cache_discovery=False),
@@ -93,48 +103,78 @@ def list_children(
     )
 
 
+def list_all_children(drive: Any, folder_id: str) -> list[dict[str, Any]]:
+    """Every direct child of a folder, reading all pages."""
+    out: list[dict[str, Any]] = []
+    token: str | None = None
+    while True:
+        page = list_children(drive, folder_id, page_size=1000, page_token=token)
+        out += page.get("files", [])
+        token = page.get("nextPageToken")
+        if not token:
+            return out
+
+
 def list_folder_files(
     drive: Any,
     folder_ids: Iterable[str],
     mime_types: Iterable[str] | None = None,
     log: Callable[[str], None] = lambda _: None,
+    *,
+    make_drive: Callable[[], Any] | None = None,
+    workers: int = 1,
 ) -> Iterator[dict[str, Any]]:
     """Every file inside any of the folders, including files in their subfolders.
 
     A file reachable from more than one folder is returned once, and a folder reached
     twice is only read once. If mime_types is given, only files of those types are
     returned. Progress (folders read, files found) is logged every 10 folders.
+
+    Folders are read breadth-first, one level at a time. With `make_drive` and
+    `workers` > 1, the folders of a level are read `workers` at a time, each thread with
+    its own Drive client from `make_drive`; results are still handled in folder order,
+    so files and progress lines are the same whatever the number of workers.
     """
     wanted = set(mime_types) if mime_types is not None else None
     seen_files: set[str] = set()
     seen_folders: set[str] = set()
-    queue = list(folder_ids)
-    while queue:
-        folder_id = queue.pop(0)
-        if folder_id in seen_folders:
-            continue
-        seen_folders.add(folder_id)
-        token: str | None = None
-        while True:
-            page = list_children(drive, folder_id, page_size=1000, page_token=token)
-            for f in page.get("files", []):
-                if f["mimeType"] == FOLDER_MIME:
-                    queue.append(f["id"])
-                    continue
-                if f["id"] in seen_files:
-                    continue
-                if wanted is not None and f["mimeType"] not in wanted:
-                    continue
-                seen_files.add(f["id"])
-                yield f
-            token = page.get("nextPageToken")
-            if not token:
-                break
-        if len(seen_folders) % 10 == 0 or not queue:
-            log(
-                f"folders read: {len(seen_folders)} ({len(queue)} queued), "
-                f"in-scope files found: {len(seen_files)}"
-            )
+    level = list(folder_ids)
+    pool = None
+    if make_drive is not None and workers > 1:
+        client = per_thread(make_drive)
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="list")
+    try:
+        while level:
+            # Each folder is read once: drop repeats within the level and folders read
+            # in earlier levels (the order of the rest is kept).
+            todo = list(dict.fromkeys(f for f in level if f not in seen_folders))
+            if pool is not None:
+                pages = pool.map(lambda fid: list_all_children(client(), fid), todo)
+            else:
+                pages = (list_all_children(drive, fid) for fid in todo)
+            next_level: list[str] = []
+            for n, (folder_id, children) in enumerate(zip(todo, pages, strict=True), 1):
+                seen_folders.add(folder_id)
+                for f in children:
+                    if f["mimeType"] == FOLDER_MIME:
+                        next_level.append(f["id"])
+                        continue
+                    if f["id"] in seen_files:
+                        continue
+                    if wanted is not None and f["mimeType"] not in wanted:
+                        continue
+                    seen_files.add(f["id"])
+                    yield f
+                queued = len(todo) - n + len(set(next_level) - seen_folders)
+                if len(seen_folders) % 10 == 0 or not queued:
+                    log(
+                        f"folders read: {len(seen_folders)} ({queued} queued), "
+                        f"in-scope files found: {len(seen_files)}"
+                    )
+            level = next_level
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
 
 
 def get_file(drive: Any, file_id: str, fields: str = FILE_FIELDS) -> dict[str, Any]:
@@ -343,6 +383,129 @@ def export_text(services: Services, f: dict[str, Any]) -> str:
     if mime == SHEET_MIME:
         return export_sheet(services.sheets, f["id"])
     raise ValueError(f"Unsupported file type: {mime}")
+
+
+# ---------------------------------------------------------------------------
+# Exporting several files at once
+# ---------------------------------------------------------------------------
+#
+# Nearly all export time is spent waiting on HTTP round-trips, so files are exported on
+# threads. Google's batch endpoint can't do media downloads (files.export), so batching
+# requests isn't an option.
+
+
+def per_thread(make: Callable[[], T]) -> Callable[[], T]:
+    """A getter for an object built once per thread with `make` (API clients can't be
+    shared between threads: they use httplib2, which isn't thread-safe)."""
+    local = threading.local()
+
+    def get() -> T:
+        if not hasattr(local, "value"):
+            local.value = make()
+        return local.value
+
+    return get
+
+
+def threaded_export(make_services: Callable[[], Services]) -> Callable[[dict[str, Any]], str]:
+    """`export_text` that's safe to call from several threads at once.
+
+    Each thread builds its own Services (with `make_services`) the first time it
+    exports a file; see `per_thread`.
+    """
+    services = per_thread(make_services)
+    return lambda f: export_text(services(), f)
+
+
+@dataclass
+class Exported:
+    """One file's export: its body, or the error that stopped it."""
+
+    file: dict[str, Any]
+    body: str | None = None
+    error: str | None = None
+
+
+def export_files(
+    files: list[dict[str, Any]],
+    export: Callable[[dict[str, Any]], str],
+    workers: int = DEFAULT_EXPORT_WORKERS,
+) -> Iterator[Exported]:
+    """Export the files on `workers` threads, yielding results in file order.
+
+    `export` must be safe to call from several threads (see `threaded_export`). The
+    caller handles each result (writing files, recording errors, logging) on its own
+    thread as it comes, so output and logs are the same as exporting one at a time.
+    An error in one file is returned in its result, not raised.
+    """
+
+    def one(f: dict[str, Any]) -> Exported:
+        try:
+            return Exported(f, body=export(f))
+        except Exception as e:  # one bad file shouldn't stop the others
+            return Exported(f, error=f"{type(e).__name__}: {e}")
+
+    if workers <= 1 or len(files) <= 1:
+        yield from map(one, files)
+        return
+    pool = ThreadPoolExecutor(max_workers=min(workers, len(files)), thread_name_prefix="export")
+    try:
+        yield from pool.map(one, files)
+    finally:
+        # If the caller stops early (an error, Ctrl-C), don't start the files still queued.
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
+class RetryCounter(logging.Handler):
+    """Counts googleapiclient's retries (429s, rate-limit 403s, 5xx, timeouts) while active.
+
+    Used as a context manager around exports, so the run can say how often Google asked
+    it to slow down.
+    """
+
+    LOGGER = "googleapiclient.http"
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.retries = 0
+        self.rate_limited = 0
+        self._lock_count = threading.Lock()
+        self._logger = logging.getLogger(self.LOGGER)
+        self._saved_propagate = True
+
+    def emit(self, record: logging.LogRecord) -> None:
+        msg = record.getMessage()
+        if not msg.startswith("Sleeping ") or " before retry " not in msg:
+            return
+        with self._lock_count:
+            self.retries += 1
+            if msg.endswith(("after 429", "after 403")):
+                self.rate_limited += 1
+
+    def __enter__(self) -> RetryCounter:
+        self._logger.addHandler(self)
+        if self._logger.level == logging.NOTSET or self._logger.level > logging.WARNING:
+            self._saved_level: int | None = self._logger.level
+            self._logger.setLevel(logging.WARNING)
+        else:
+            self._saved_level = None
+        # Counted and summarized instead of printed one by one between progress lines.
+        self._saved_propagate = self._logger.propagate
+        self._logger.propagate = False
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._logger.removeHandler(self)
+        self._logger.propagate = self._saved_propagate
+        if self._saved_level is not None:
+            self._logger.setLevel(self._saved_level)
+
+    def summary(self) -> str:
+        """E.g. ", 12 retries (10 rate-limited)"; empty when there were none."""
+        if not self.retries:
+            return ""
+        s = "y" if self.retries == 1 else "ies"
+        return f", {self.retries} retr{s} ({self.rate_limited} rate-limited)"
 
 
 def file_metadata(f: dict[str, Any]) -> dict[str, Any]:

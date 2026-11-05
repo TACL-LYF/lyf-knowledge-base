@@ -429,14 +429,16 @@ Before the first full run, cut the text sent to the LLM down to what matters. A 
 
 Exporting Drive files one at a time is slow, and nearly all of that time is spent waiting on HTTP round-trips, so exporting several at once on threads should help a lot. Google's batch HTTP endpoint doesn't support media downloads (`files.export`), so batching requests isn't an option.
 
-- [ ] Per-thread API clients: `googleapiclient` services use `httplib2`, which isn't thread-safe, so each worker builds its own `Services` from the same credentials (`threading.local()`)
-- [ ] One shared parallel-export helper, used by both `kb pull` (`pull_drive`) and `kb update` (`export_drive`): a `ThreadPoolExecutor` exports the files, and writing files, recording errors, and logging stay on the main thread, in file order, so the output and logs are the same as now
-- [ ] `drive.export_workers` in `config.yaml` (default 8)
-- [ ] Rate limits: everything runs as one service account, so per-user quotas apply. Sheets reads (about 60 a minute per user, at least 2 calls per Sheet) cap Sheets at roughly 30 a minute no matter how many workers there are. The existing `num_retries` backoff absorbs 429s; check that a full pull doesn't end up retrying all the time
-- [ ] Optional: read several folders at once in `list_folder_files`, if listing turns out to take a noticeable share of the time
-- [ ] Test: parallel export with a fake exporter gives the same results, order, and error handling as the one-at-a-time version
+- [x] Per-thread API clients: `googleapiclient` services use `httplib2`, which isn't thread-safe, so each worker builds its own `Services` from the same credentials (`threading.local()`)
+- [x] One shared parallel-export helper, used by both `kb pull` (`pull_drive`) and `kb update` (`export_drive`): a `ThreadPoolExecutor` exports the files, and writing files, recording errors, and logging stay on the main thread, in file order, so the output and logs are the same as now
+- [x] `drive.export_workers` in `config.yaml` (default 8); it also sets how many folders are listed at once
+- [x] Rate limits: everything runs as one service account, so per-user quotas apply. Sheets reads (about 60 a minute per user, at least 2 calls per Sheet) cap Sheets at roughly 30 a minute no matter how many workers there are. The existing `num_retries` backoff absorbs 429s; check that a full pull doesn't end up retrying all the time. The export stage now reports retries (from googleapiclient's retry warnings) in its result line. A full pull with 8 workers had none
+- [x] Optional: read several folders at once in `list_folder_files`, if listing turns out to take a noticeable share of the time. It did (90s of a 589s pull, and most of the run once exports were parallel), so each level of the folder tree is read in parallel, breadth-first, with results handled in folder order so the file list and its order don't change
+- [x] Test: parallel export with a fake exporter gives the same results, order, and error handling as the one-at-a-time version
 
 **Done when:** a full `kb pull --source drive` is noticeably faster than before (compare the export stage's time in the logs), with the same files and no new errors.
+
+**Result (2026-11-05, 277 files):** listing 90s → 12s, export 499s → 54s, whole pull 589s → 66s. The files and log order were identical to the one-at-a-time pull (the only difference was a Sheet whose `TODAY()` cell changed between runs). There were 0 errors and 0 rate-limited retries.
 
 ### M4: Synthesis and publish
 

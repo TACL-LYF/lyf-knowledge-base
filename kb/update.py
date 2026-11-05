@@ -73,13 +73,14 @@ class Sources:
     # cursors (None = full read), refresh_names → DiscordPull
     discord_fetch: Callable[[dict[str, Any] | None, bool], dsc.DiscordPull]
     drive_list: Callable[[], list[dict[str, Any]]]
-    drive_export: Callable[[dict[str, Any]], str]
+    drive_export: Callable[[dict[str, Any]], str]  # must be thread-safe (export_files)
     kb_folder: st.RemoteFolder
     llm: llm_mod.LLM | None = None  # None: no extraction possible (e.g. a dry run)
 
     @classmethod
     def real(cls, cfg: Config, log: Log) -> Sources:
-        services = gdrive.Services.from_key(cfg.google_credentials_path)
+        creds = gdrive.credentials(cfg.google_credentials_path)
+        services = gdrive.Services.from_credentials(creds)
         cache = dsc.MemberCache(cfg.data_dir / MEMBER_CACHE)
         client: llm_mod.LLM | None = None
         if cfg.anthropic_api_key:
@@ -110,10 +111,16 @@ class Sources:
             discord_fetch=discord_fetch,
             drive_list=lambda: list(
                 gdrive.list_folder_files(
-                    services.drive, cfg.drive_source_folder_ids, cfg.drive_file_types, log
+                    services.drive,
+                    cfg.drive_source_folder_ids,
+                    cfg.drive_file_types,
+                    log,
+                    make_drive=lambda: gdrive.Services.from_credentials(creds).drive,
+                    workers=cfg.drive_export_workers,
                 )
             ),
-            drive_export=lambda f: gdrive.export_text(services, f),
+            # Called from several threads at once, so each builds its own clients.
+            drive_export=gdrive.threaded_export(lambda: gdrive.Services.from_credentials(creds)),
             kb_folder=st.DriveFolder(services.drive, cfg.drive_kb_folder_id),
             llm=client,
         )
@@ -409,18 +416,21 @@ def export_drive(
     manifest: dict[str, dict[str, Any]],
     export: Callable[[dict[str, Any]], str],
     log: Log,
+    workers: int = gdrive.DEFAULT_EXPORT_WORKERS,
 ) -> None:
+    """Export new and modified files, `workers` at a time; results are handled in order."""
     todo = changes.new + changes.modified
     modified_ids = {f["id"] for f in changes.modified}
     width = len(str(len(todo)))
-    for n, f in enumerate(todo, 1):
+    for n, r in enumerate(gdrive.export_files(todo, export, workers), 1):
+        f = r.file
         label = f"({n:>{width}}/{len(todo)}) {f.get('name') or f['id']}"
-        try:
-            body = export(f)
-        except Exception as e:  # one bad file shouldn't stop the run
-            changes.errors[f["id"]] = f"{type(e).__name__}: {e}"
-            log(f"{label}: error: {changes.errors[f['id']]}")
+        if r.error is not None:  # one bad file shouldn't stop the run
+            changes.errors[f["id"]] = r.error
+            log(f"{label}: error: {r.error}")
         else:
+            assert r.body is not None
+            body = r.body
             changes.exported[f["id"]] = body
             if f["id"] in modified_ids:
                 entry = manifest.get(f"drive:{f['id']}") or {}
@@ -1043,12 +1053,14 @@ def _pull(
     if not todo:
         stages.skip("Exporting new and modified Drive files", "nothing to export")
     else:
-        with stages.stage(f"Exporting {_plural(todo, 'new or modified Drive file')}") as s:
-            export_drive(drive, state.manifest, sources.drive_export, s.detail)
+        workers = cfg.drive_export_workers
+        title = f"Exporting {_plural(todo, 'new or modified Drive file')} ({workers} at a time)"
+        with stages.stage(title) as s, gdrive.RetryCounter() as retries:
+            export_drive(drive, state.manifest, sources.drive_export, s.detail, workers)
             s.result = (
                 f"{len(drive.new)} new, {len(drive.changed)} changed, "
                 f"{len(drive.unchanged)} with the same text (skipped), "
-                f"{_plural(len(drive.errors), 'error')}"
+                f"{_plural(len(drive.errors), 'error')}{retries.summary()}"
             )
     return pull, discord, retried, drive, files_by_id
 
