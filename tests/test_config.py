@@ -103,3 +103,27 @@ def test_models_default_when_unset(tmp_path):
 def test_old_single_model_setting_is_rejected(tmp_path):
     with pytest.raises(ConfigError, match="extract_model"):
         load_config(write(tmp_path, CONFIG.split("llm:")[0] + "llm:\n  model: x\n"))
+
+
+def test_extraction_settings_default_when_unset(tmp_path):
+    cfg = load_config(write(tmp_path, CONFIG))
+    assert cfg.llm_max_item_tokens == 100_000
+    assert cfg.llm_batch_min_requests == 20
+    assert cfg.llm_extract_effort is None
+    assert cfg.drive_allow_large_files == []
+
+
+def test_extraction_settings(tmp_path):
+    extra = "  max_item_tokens: 5000\n  batch_min_requests: 3\n  extract_effort: high\n"
+    config = CONFIG + extra
+    config = config.replace(
+        '  kb_folder_id: "kb"\n', '  kb_folder_id: "kb"\n  allow_large_files: ["big"]\n'
+    )
+    cfg = load_config(write(tmp_path, config))
+    assert (cfg.llm_max_item_tokens, cfg.llm_batch_min_requests) == (5000, 3)
+    assert cfg.llm_extract_effort == "high" and cfg.drive_allow_large_files == ["big"]
+
+
+def test_bad_effort_is_rejected(tmp_path):
+    with pytest.raises(ConfigError, match="extract_effort"):
+        load_config(write(tmp_path, CONFIG + "  extract_effort: extreme\n"))

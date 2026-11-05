@@ -113,6 +113,7 @@ Every piece of feedback in the doc lists the citations it came from. The full li
 
 How the running list works:
 
+- A citation is created the first time a record cites that message or file, so messages with nothing worth keeping ("+1") don't fill the list.
 - Each citation gets a permanent ID (`C-0001`, `C-0002`, …) when it's first seen. IDs are never reused or renumbered. The run lock keeps numbering safe when several people run the pipeline.
 - Each Drive file has exactly one citation. When the file is edited, it keeps the same citation ID.
 - One feedback record can have several citations, for example several messages in a thread saying the same thing. When synthesis groups records into a theme, the theme lists every citation from its records.
@@ -230,6 +231,8 @@ A `program_info` record has the same IDs, `kind`, `programming_type` (required, 
 }
 ```
 
+Both kinds also carry `quote` (a short verbatim excerpt from the source supporting the record, or `null`, used by synthesis to pick quotes), `prompt_version`, and `model`.
+
 Every record, of either kind, has `applies_to` and `date_basis`. For feedback, `applies_to` is the period the feedback is about. For a `program_info` fact, it's the period the fact is true for. `date_basis` records how `applies_to` was worked out:
 
 - `stated`: the source gives the date ("in September 2025 we moved…").
@@ -317,6 +320,9 @@ lyf-knowledge-base/
 kb update             # read new Discord messages + new/changed Drive files → extract → rebuild doc
 kb update --dry-run   # show what's new or changed; no LLM calls, no writes
 kb update --full      # rare: read the whole Discord channel and export every Drive file again
+kb update --pull      # only the pull step; new items wait as `pending`
+kb update --extract   # only the extract step, for pending items (reads raw/ snapshots, not the sources)
+kb update --limit N   # extract at most N items; the rest stay `pending`
 kb status             # last run, cursors, item counts, recent errors, programming types with counts, records per year, share of source_date dates
 kb rebuild            # extract everything again (e.g., after a big prompt change)
 kb pull               # M1/debugging: full read of Discord + Drive into data/raw/ (local only)
@@ -385,17 +391,18 @@ Before the first full run, cut the text sent to the LLM down to what matters. A 
 - [x] `kb update --full` exports every Drive file again, so the image removal reaches files already in the manifest. Run it once after the exporter change
 - [x] Upload raw snapshots to `raw/` in the Knowledge Base folder again (new Discord messages per day, new or changed Drive exports), now that they're small
 - [x] Separate models for the two steps in `config.yaml`: `llm.extract_model` (default `claude-opus-5-5`, run through the Batch API for large runs) and `llm.synthesis_model` (default `claude-opus-5-5`). See [Choosing models](#choosing-models)
-- [ ] Size check: estimate tokens for each item (characters ÷ 4 is close enough) and show the per-item estimate, the total, and the estimated cost in `kb update --dry-run`. Items over `llm.max_item_tokens` in `config.yaml` (default 100,000) are given status `skipped` with the reason, and listed in the run summary and `kb status`, unless their file ID is in `drive.allow_large_files`
-- [ ] `citations.py`: permanent IDs; one citation per Discord message and one per Drive file; active/removed status
-- [ ] Extraction prompt (in `prompts/`, versioned) framed around community programming, with structured output. Each record has a `kind`:
+- [x] Size check: estimate tokens for each item (characters ÷ 4 is close enough) and show the per-item estimate, the total, and the estimated cost in `kb update --dry-run`. Items over `llm.max_item_tokens` in `config.yaml` (default 100,000) are given status `skipped` with the reason, and listed in the run summary and `kb status`, unless their file ID is in `drive.allow_large_files`
+- [x] `citations.py`: permanent IDs; one citation per Discord message and one per Drive file; active/removed status
+- [x] Extraction prompt (in `prompts/`, versioned) framed around community programming, with structured output. Each record has a `kind`:
   - `feedback`: feedback, programming type or `null`, category, sentiment, `applies_to` and `date_basis` (the period the feedback is about, not when it was given), and citations (Discord message IDs, or the file)
   - `program_info`: a description or history fact, `info_type`, `applies_to` and `date_basis`, programming type (required), and citations. The prompt asks for the period each fact is true for, using what the source says or clues such as the file name and message date, and to use `source_date` only when there are no clues
-- [ ] Give the prompt the saved list of programming types, and add new types to `programming_types.json`
-- [ ] Check every record: it must have at least one citation, each cited Discord message must exist in the item, `program_info` records must name a programming type, and every record must have an `applies_to` in `YYYY`, `YYYY-MM`, or `YYYY-MM-DD` form. If `date_basis` is `source_date`, `applies_to` is set from the citation's date in code, not taken from the model
-- [ ] New messages in an old thread: extract only those, with earlier messages as context
-- [ ] Retries, plus per-item `error` status so one failure doesn't stop the run
-- [ ] Token and cost summary at the end of each run
-- [ ] `kb status`: records per year, and the share with `date_basis: source_date`, so weak dating is easy to spot
+- [x] Give the prompt the saved list of programming types, and add new types to `programming_types.json`
+- [x] Check every record: it must have at least one citation, each cited Discord message must exist in the item, `program_info` records must name a programming type, and every record must have an `applies_to` in `YYYY`, `YYYY-MM`, or `YYYY-MM-DD` form. If `date_basis` is `source_date`, `applies_to` is set from the citation's date in code, not taken from the model
+- [x] New messages in an old thread: extract only those, with earlier messages as context
+- [x] Retries, plus per-item `error` status so one failure doesn't stop the run
+- [x] Token and cost summary at the end of each run
+- [x] `kb status`: records per year, and the share with `date_basis: source_date`, so weak dating is easy to spot
+- [x] Steps: `kb update` runs every step by default; `--pull` and `--extract` run one (M4 adds `--synthesize`). Items pulled but not extracted get status `pending`; Discord items keep their messages in the manifest, and `--extract` reads Drive files from `raw/drive/`. `--limit N` extracts at most N items, for a small first run
 
 **Done when:** no exported Doc contains base64 image data; `--dry-run` shows token and cost estimates, and a file over the size limit is skipped and reported unless it's allowed in config; a full first run extracts records for every item that isn't skipped; a person checks about 20 records to confirm the feedback and program facts are accurate, the programming type makes sense, records have the right `applies_to` (including feedback about a past year), and each citation link opens the right message or file; the programming types list has no obvious duplicates; and a second run makes 0 LLM calls.
 
@@ -409,6 +416,7 @@ Before the first full run, cut the text sent to the LLM down to what matters. A 
 - [ ] Render the Programs doc in the structure above, with citation markers and links to and from Consolidated Feedback
 - [ ] `publish.py`: create each doc on the first run, then update it in place with `files.update`, and save both doc IDs in state
 - [ ] Write the Citations sheet from `citations.jsonl`, and its Records tab from `extracted.jsonl`
+- [ ] Citation links: render every `[C-0042]` marker in both docs, and each entry in the citations appendices, as a markdown link to the citation's saved `link` (the Discord message link or the Drive file's `webViewLink`), so the upload in `files.update` turns them into clickable links. Make the Citations sheet's link column clickable too. A `removed` citation shows as plain text with "(removed)" instead of a dead link. Discord links open only for server members who can see that channel, and Drive links follow each file's sharing settings; say so in the appendix
 
 **Done when:** both docs exist in Drive and every feedback point and program fact has working citation links; each programming type in Programs has a description and a history in date order; a test programming type whose 2023 and 2024 docs describe different setups, with no source mentioning the change, shows that change in its history with citations to both docs; a theme whose feedback stops after a program change is labeled **likely resolved**; the Records tab can be filtered to one year; the Citations sheet lists every citation; and after adding one new piece of feedback and re-running, it shows up under "New since last update" with a new citation ID while existing IDs and both doc links stay the same.
 

@@ -4,6 +4,9 @@
     ├── cursors.json     Discord cursors + when the last successful run started
     ├── manifest.json    one entry per source item (Discord thread/message, Drive file)
     ├── run_log.json     history of runs
+    ├── citations.jsonl  running list of citations (kb/citations.py)
+    ├── extracted.jsonl  saved records (kb/extract.py)
+    ├── programming_types.json
     └── lock             held while a run is in progress
 
 Drive is the source of truth. A run takes the lock, downloads `_state/` into
@@ -33,6 +36,10 @@ CURSORS = "cursors.json"
 MANIFEST = "manifest.json"
 RUN_LOG = "run_log.json"
 STATE_FILES = (CURSORS, MANIFEST, RUN_LOG)
+# Written by extraction (kb/extract.py, kb/citations.py):
+CITATIONS = "citations.jsonl"
+EXTRACTED = "extracted.jsonl"
+PROGRAMMING_TYPES = "programming_types.json"
 
 RUN_LOG_KEEP = 200  # older run log entries are dropped
 

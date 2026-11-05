@@ -22,6 +22,9 @@ DEFAULT_FILE_TYPES = [
 # gets the stronger model; synthesis is rebuilt every run and can be switched any time.
 DEFAULT_EXTRACT_MODEL = "claude-opus-5-5"
 DEFAULT_SYNTHESIS_MODEL = "claude-opus-5-5"
+DEFAULT_MAX_ITEM_TOKENS = 100_000
+DEFAULT_BATCH_MIN_REQUESTS = 20
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
 class ConfigError(Exception):
@@ -35,8 +38,12 @@ class Config:
     drive_source_folder_ids: list[str]
     drive_kb_folder_id: str
     drive_file_types: list[str] = field(default_factory=lambda: list(DEFAULT_FILE_TYPES))
+    drive_allow_large_files: list[str] = field(default_factory=list)
     llm_extract_model: str = DEFAULT_EXTRACT_MODEL
     llm_synthesis_model: str = DEFAULT_SYNTHESIS_MODEL
+    llm_extract_effort: str | None = None  # None: the model's default
+    llm_max_item_tokens: int = DEFAULT_MAX_ITEM_TOKENS
+    llm_batch_min_requests: int = DEFAULT_BATCH_MIN_REQUESTS
     lock_timeout_minutes: int = 60
     data_dir: Path = REPO_ROOT / "data"
 
@@ -106,6 +113,12 @@ def load_config(path: Path | None = None, env_file: Path | None = None) -> Confi
             "steps can use different models. Update config.yaml (see config.example.yaml)."
         )
 
+    effort = str(llm.get("extract_effort") or "").strip() or None
+    if effort is not None and effort not in EFFORTS:
+        raise ConfigError(
+            f"llm.extract_effort must be one of {', '.join(EFFORTS)} (or left out), not {effort!r}."
+        )
+
     creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
 
     return Config(
@@ -116,6 +129,10 @@ def load_config(path: Path | None = None, env_file: Path | None = None) -> Confi
         drive_file_types=list(drive.get("file_types") or DEFAULT_FILE_TYPES),
         llm_extract_model=str(llm.get("extract_model") or DEFAULT_EXTRACT_MODEL),
         llm_synthesis_model=str(llm.get("synthesis_model") or DEFAULT_SYNTHESIS_MODEL),
+        llm_extract_effort=effort,
+        llm_max_item_tokens=int(llm.get("max_item_tokens") or DEFAULT_MAX_ITEM_TOKENS),
+        llm_batch_min_requests=int(llm.get("batch_min_requests") or DEFAULT_BATCH_MIN_REQUESTS),
+        drive_allow_large_files=_id_list(drive.get("allow_large_files")),
         lock_timeout_minutes=int(state.get("lock_timeout_minutes") or 60),
         data_dir=_resolve(str(paths.get("data_dir") or "data"), base),
         discord_bot_token=os.environ.get("DISCORD_BOT_TOKEN", "").strip(),
