@@ -406,6 +406,19 @@ Before the first full run, cut the text sent to the LLM down to what matters. A 
 
 **Done when:** no exported Doc contains base64 image data; `--dry-run` shows token and cost estimates, and a file over the size limit is skipped and reported unless it's allowed in config; a full first run extracts records for every item that isn't skipped; a person checks about 20 records to confirm the feedback and program facts are accurate, the programming type makes sense, records have the right `applies_to` (including feedback about a past year), and each citation link opens the right message or file; the programming types list has no obvious duplicates; and a second run makes 0 LLM calls.
 
+### M3.5: Faster Drive exports
+
+Exporting Drive files one at a time is slow, and nearly all of that time is spent waiting on HTTP round-trips, so exporting several at once on threads should help a lot. Google's batch HTTP endpoint doesn't support media downloads (`files.export`), so batching requests isn't an option.
+
+- [ ] Per-thread API clients: `googleapiclient` services use `httplib2`, which isn't thread-safe, so each worker builds its own `Services` from the same credentials (`threading.local()`)
+- [ ] One shared parallel-export helper, used by both `kb pull` (`pull_drive`) and `kb update` (`export_drive`): a `ThreadPoolExecutor` exports the files, and writing files, recording errors, and logging stay on the main thread, in file order, so the output and logs are the same as now
+- [ ] `drive.export_workers` in `config.yaml` (default 8)
+- [ ] Rate limits: everything runs as one service account, so per-user quotas apply. Sheets reads (about 60 a minute per user, at least 2 calls per Sheet) cap Sheets at roughly 30 a minute no matter how many workers there are. The existing `num_retries` backoff absorbs 429s; check that a full pull doesn't end up retrying all the time
+- [ ] Optional: read several folders at once in `list_folder_files`, if listing turns out to take a noticeable share of the time
+- [ ] Test: parallel export with a fake exporter gives the same results, order, and error handling as the one-at-a-time version
+
+**Done when:** a full `kb pull --source drive` is noticeably faster than before (compare the export stage's time in the logs), with the same files and no new errors.
+
 ### M4: Synthesis and publish
 
 - [ ] `synthesize.py`: group `feedback` records by programming type, then into themes within each type; group records with no type into LLM-found themes; merge duplicate type names; rank themes with recent feedback weighted higher, and pick quotes (recent ones preferred). For each theme, add its breakdown by year and the most recent date it was mentioned
