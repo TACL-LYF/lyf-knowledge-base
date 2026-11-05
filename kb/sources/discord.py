@@ -1,6 +1,7 @@
 """Discord source: read the channel and its threads via the REST API, and build items.
 
-M1 reads everything (full read). M2 adds cursors so later runs read only new messages.
+A full read fetches everything. An incremental read takes message-ID cursors (the last
+message read in the main channel and in each thread) and fetches only what's newer.
 
 An **item** is the unit later sent to the LLM:
 - one per thread: every message in the thread, including the message that started it;
@@ -10,9 +11,13 @@ An **item** is the unit later sent to the LLM:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -178,7 +183,12 @@ class DiscordClient:
 
 @dataclass
 class DiscordPull:
-    """Everything read from the channel in one pass, before items are built."""
+    """Everything read from the channel in one pass, before items are built.
+
+    In an incremental read, `channel_messages` holds only messages after the channel
+    cursor, and `threads` only threads with messages after their cursor. Those threads
+    are read in full so earlier messages can be given as context.
+    """
 
     server_id: str
     channel: dict[str, Any]
@@ -188,6 +198,25 @@ class DiscordPull:
     # user ID → name shown in the server (nickname), for authors who are still members
     member_names: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    # Threads that exist but couldn't be read (their messages must not count as deleted)
+    unreadable_threads: set[str] = field(default_factory=set)
+    # Cursors to save once the run succeeds: last message ID read, channel and per thread
+    channel_cursor: str | None = None
+    thread_cursors: dict[str, str] = field(default_factory=dict)
+    full: bool = True
+
+
+def _max_id(messages: Iterable[dict[str, Any]], current: str | None) -> str | None:
+    ids = [int(m["id"]) for m in messages]
+    if current:
+        ids.append(int(current))
+    return str(max(ids)) if ids else None
+
+
+def _newer(message_id: str | None, cursor: str | None) -> bool:
+    if not message_id:
+        return False
+    return cursor is None or int(message_id) > int(cursor)
 
 
 def fetch_all(
@@ -195,16 +224,52 @@ def fetch_all(
     server_id: str,
     channel_id: str,
     log: Callable[[str], None] = lambda _: None,
+    *,
+    member_cache: MemberCache | None = None,
+    refresh_names: bool = False,
 ) -> DiscordPull:
     """Read the main channel and every thread in it (active, archived public and private)."""
+    return fetch(
+        client,
+        server_id,
+        channel_id,
+        None,
+        log,
+        member_cache=member_cache,
+        refresh_names=refresh_names,
+    )
+
+
+def fetch(
+    client: DiscordClient,
+    server_id: str,
+    channel_id: str,
+    cursors: dict[str, Any] | None,
+    log: Callable[[str], None] = lambda _: None,
+    *,
+    member_cache: MemberCache | None = None,
+    refresh_names: bool = False,
+) -> DiscordPull:
+    """Read the channel and its threads.
+
+    With `cursors=None` everything is read. Otherwise `cursors` is
+    `{"discord_channel": id, "discord_threads": {thread_id: id}}`: only channel messages
+    after the channel cursor are read, and only threads whose latest message is newer
+    than their cursor (threads with no cursor are new and always read).
+    """
+    full = cursors is None
+    cursors = cursors or {}
+    chan_cursor: str | None = cursors.get("discord_channel")
+    thread_cursors: dict[str, str] = dict(cursors.get("discord_threads") or {})
     warnings: list[str] = []
     channel = client.get_channel(channel_id)
 
     if channel.get("type") in FORUM_TYPES:
         channel_messages: list[dict[str, Any]] = []
     else:
-        channel_messages = client.all_messages(channel_id)
-    log(f"#{channel.get('name')}: {len(channel_messages)} channel messages")
+        channel_messages = client.all_messages(channel_id, after=chan_cursor or "0")
+    new_word = "" if full else "new "
+    log(f"#{channel.get('name')}: {len(channel_messages)} {new_word}channel messages")
 
     threads: dict[str, dict[str, Any]] = {}
     for t in client.active_threads(server_id, channel_id):
@@ -221,22 +286,37 @@ def fetch_all(
         )
 
     ordered = sorted(threads.values(), key=lambda t: int(t["id"]))
+    if not full:
+        ordered = [
+            t
+            for t in ordered
+            if t["id"] not in thread_cursors
+            or _newer(t.get("last_message_id"), thread_cursors[t["id"]])
+        ]
+        log(f"threads: {len(threads)} found, {len(ordered)} with new messages to read")
+    else:
+        log(f"threads: {len(threads)} found (active and archived), reading all")
     thread_messages: dict[str, list[dict[str, Any]]] = {}
+    unreadable: set[str] = set()
     for i, t in enumerate(ordered, 1):
         try:
             thread_messages[t["id"]] = client.all_messages(t["id"])
         except DiscordForbidden as e:
             warnings.append(f"Thread '{t.get('name')}' ({t['id']}) was skipped: {e}")
+            unreadable.add(t["id"])
             continue
-        if i % 25 == 0 or i == len(ordered):
+        if i % 10 == 0 or i == len(ordered):
             log(f"threads: {i}/{len(ordered)} read")
 
+    for tid, msgs in thread_messages.items():
+        latest = _max_id(msgs, thread_cursors.get(tid))
+        if latest:
+            thread_cursors[tid] = latest
+
+    all_fetched = channel_messages + [m for msgs in thread_messages.values() for m in msgs]
     member_names = fetch_member_names(
-        client,
-        server_id,
-        channel_messages + [m for msgs in thread_messages.values() for m in msgs],
+        client, server_id, all_fetched, cache=member_cache, refresh=refresh_names, log=log
     )
-    log(f"server nicknames: {len(member_names)} found")
 
     return DiscordPull(
         server_id=server_id,
@@ -246,24 +326,107 @@ def fetch_all(
         threads=[t for t in ordered if t["id"] in thread_messages],
         thread_messages=thread_messages,
         warnings=warnings,
+        unreadable_threads=unreadable,
+        channel_cursor=_max_id(channel_messages, chan_cursor),
+        thread_cursors=thread_cursors,
+        full=full,
     )
 
 
+def _now() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class MemberCache:
+    """Local record of server members already looked up: user ID → names.
+
+    Looking up a member's server nickname is one API call per author, so names are
+    remembered between runs in a local JSON file and only new authors are looked up.
+    Members who have no nickname or have left the server are remembered too
+    (`nick: null`), so they aren't looked up again either. Pass `refresh=True` to
+    `fetch_member_names` to look everyone up again (e.g. after nicknames change).
+
+        {"<user id>": {"username": "...", "nick": "..." | null,
+                       "display_name": "...", "checked_at": "..."}}
+    """
+
+    def __init__(self, path: Path | None = None, entries: dict[str, dict] | None = None):
+        self.path = path
+        self.entries: dict[str, dict[str, Any]] = entries if entries is not None else {}
+        if entries is None and path is not None and path.is_file():
+            try:
+                self.entries = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                self.entries = {}
+
+    def __contains__(self, user_id: str) -> bool:
+        return user_id in self.entries
+
+    def nick(self, user_id: str) -> str | None:
+        return (self.entries.get(user_id) or {}).get("nick")
+
+    def record(self, author: dict[str, Any], nick: str | None) -> None:
+        self.entries[author["id"]] = {
+            "username": author.get("username"),
+            "nick": nick,
+            "display_name": nick or author.get("global_name") or author.get("username"),
+            "checked_at": _now(),
+        }
+
+    def save(self) -> None:
+        if self.path is None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        data = json.dumps(self.entries, indent=2, ensure_ascii=False, sort_keys=True)
+        self.path.write_text(data + "\n", encoding="utf-8")
+
+
 def fetch_member_names(
-    client: DiscordClient, server_id: str, messages: Iterable[dict[str, Any]]
+    client: DiscordClient,
+    server_id: str,
+    messages: Iterable[dict[str, Any]],
+    *,
+    cache: MemberCache | None = None,
+    refresh: bool = False,
+    log: Callable[[str], None] = lambda _: None,
 ) -> dict[str, str]:
-    """Server nicknames for every human author, including authors of replied-to messages."""
-    user_ids: set[str] = set()
+    """Server nicknames for every human author, including authors of replied-to messages.
+
+    With a cache, authors already in it aren't looked up again (unless `refresh`), and
+    every author looked up is added to it. The cache is saved before returning.
+    """
+    authors: dict[str, dict[str, Any]] = {}
     for m in messages:
         for x in (m, m.get("referenced_message") or {}):
             author = x.get("author") or {}
             if author.get("id") and not author.get("bot"):
-                user_ids.add(author["id"])
+                authors[author["id"]] = author
     names: dict[str, str] = {}
-    for uid in sorted(user_ids):
-        member = client.get_member(server_id, uid)
-        if member and member.get("nick"):
-            names[uid] = member["nick"]
+    to_look_up = [u for u in authors if cache is None or refresh or u not in cache]
+    if to_look_up:
+        cached = len(authors) - len(to_look_up)
+        log(
+            f"server nicknames: looking up {len(to_look_up)} of {len(authors)} authors"
+            + (f" ({cached} already cached)" if cached else "")
+        )
+    looked_up = 0
+    for uid in sorted(authors):
+        if cache is not None and uid in cache and not refresh:
+            nick = cache.nick(uid)
+        else:
+            looked_up += 1
+            if looked_up % 25 == 0:
+                log(f"server nicknames: {looked_up}/{len(to_look_up)} looked up")
+            member = client.get_member(server_id, uid)
+            nick = (member or {}).get("nick") or None
+            if cache is not None:
+                cache.record(authors[uid], nick)
+        if nick:
+            names[uid] = nick
+    if cache is not None:
+        cache.save()
+    how = f"{len(to_look_up)} looked up" if to_look_up else "all from the local cache"
+    log(f"server nicknames: {len(names)} of {len(authors)} authors have one ({how})")
     return names
 
 
@@ -385,3 +548,39 @@ def build_items(pull: DiscordPull) -> list[dict[str, Any]]:
 
 def count_messages(items: Iterable[dict[str, Any]]) -> int:
     return sum(len(i["messages"]) for i in items)
+
+
+def message_hash(m: dict[str, Any]) -> str:
+    """Hash of a simplified message's text and attachment names, to spot edits.
+
+    Attachment URLs are left out because Discord signs them and they change over time.
+    """
+    names = [a.get("filename") or "" for a in m.get("attachments", [])]
+    payload = json.dumps([m.get("content") or "", names], ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def split_new(
+    items: Iterable[dict[str, Any]], is_new: Callable[[dict[str, Any]], bool]
+) -> list[dict[str, Any]]:
+    """Keep only new messages in each item; earlier ones become read-only context.
+
+    Items with no new messages are dropped. Context keeps chronological order, with
+    any existing context (e.g. a replied-to message) first.
+    """
+    out = []
+    for item in items:
+        new = [m for m in item["messages"] if is_new(m)]
+        if not new:
+            continue
+        old = [m for m in item["messages"] if not is_new(m)]
+        out.append({**item, "messages": new, "context": item["context"] + old})
+    return out
+
+
+def human_message_ids(pull: DiscordPull) -> set[str]:
+    """IDs of every human message in a pull, including thread starters from the channel."""
+    ids: set[str] = set()
+    for item in build_items(pull):
+        ids.update(m["id"] for m in item["messages"])
+    return ids

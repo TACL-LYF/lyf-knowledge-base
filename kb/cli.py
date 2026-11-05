@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import click
+from googleapiclient.errors import HttpError
 
 from kb import __version__
 from kb import pull as raw_pull
+from kb import update as upd
 from kb.config import ConfigError, load_config
 from kb.pull import SOURCES
 from kb.sources.discord import DiscordError
+from kb.state import LockError
 
 
 def _not_yet(milestone: str) -> None:
@@ -28,8 +31,29 @@ def main() -> None:
 @click.option("--full", is_flag=True, help="Re-read the whole Discord channel (rarely needed).")
 @click.option("--force-unlock", is_flag=True, help="Clear a stale run lock before starting.")
 def update(dry_run: bool, full: bool, force_unlock: bool) -> None:
-    """Read new content, extract feedback, and rebuild the doc."""
-    _not_yet("M2–M4")
+    """Read new content, extract feedback, and rebuild the doc.
+
+    For now (M2) this reads what's new and saves it; extraction and the doc arrive in
+    M3–M4.
+    """
+    try:
+        cfg = load_config()
+        cfg.require(
+            "discord_server_id",
+            "discord_channel_id",
+            "discord_bot_token",
+            "drive_source_folder_ids",
+            "drive_kb_folder_id",
+            "google_credentials_path",
+        )
+        result = upd.run_update(
+            cfg, dry_run=dry_run, full=full, force_unlock=force_unlock, log=click.echo
+        )
+    except (ConfigError, DiscordError, LockError) as e:
+        raise click.ClickException(str(e)) from e
+    except HttpError as e:
+        raise click.ClickException(f"Google API error: {e}") from e
+    upd.report(result, upd.st.State(cfg.data_dir / "state").load().manifest, click.echo)
 
 
 @main.command()
@@ -40,7 +64,12 @@ def update(dry_run: bool, full: bool, force_unlock: bool) -> None:
     multiple=True,
     help="Only pull this source (repeatable). Default: all.",
 )
-def pull(sources: tuple[str, ...]) -> None:
+@click.option(
+    "--refresh-names",
+    is_flag=True,
+    help="Look up every author's server nickname again instead of using the local cache.",
+)
+def pull(sources: tuple[str, ...], refresh_names: bool) -> None:
     """Read everything from Discord and Drive into data/raw/ (local only, full read)."""
     sources = sources or SOURCES
     try:
@@ -49,7 +78,7 @@ def pull(sources: tuple[str, ...]) -> None:
             cfg.require("discord_server_id", "discord_channel_id", "discord_bot_token")
         if "drive" in sources:
             cfg.require("drive_source_folder_ids", "google_credentials_path")
-        raw_pull.pull(cfg, sources, log=click.echo)
+        raw_pull.pull(cfg, sources, log=click.echo, refresh_names=refresh_names)
     except (ConfigError, DiscordError) as e:
         raise click.ClickException(str(e)) from e
 
@@ -57,7 +86,15 @@ def pull(sources: tuple[str, ...]) -> None:
 @main.command()
 def status() -> None:
     """Show last run, cursors, item counts, errors, and programming types."""
-    _not_yet("M2")
+    try:
+        cfg = load_config()
+        cfg.require("drive_kb_folder_id", "google_credentials_path")
+        for line in upd.status(cfg):
+            click.echo(line)
+    except ConfigError as e:
+        raise click.ClickException(str(e)) from e
+    except HttpError as e:
+        raise click.ClickException(f"Google API error: {e}") from e
 
 
 @main.command()

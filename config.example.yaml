@@ -7,7 +7,7 @@ discord:
 
 drive:
   source_folder_ids: # folders with existing feedback (service account: Viewer)
-    - "" # one folder ID per line; only direct children are read for now
+    - "" # one folder ID per line; subfolders are read too
   kb_folder_id: "" # Knowledge Base folder in a Shared Drive (service account: Content manager)
   file_types: # Google file types read from the source folders
     - application/vnd.google-apps.document

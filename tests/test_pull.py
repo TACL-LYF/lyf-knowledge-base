@@ -63,12 +63,47 @@ def test_failed_pull_leaves_previous_output(tmp_path, monkeypatch):
 
 
 def test_pull_summary_keeps_other_source_on_partial_pull(tmp_path, monkeypatch):
-    monkeypatch.setattr(pull, "pull_drive", lambda *a: {"files": 2})
-    monkeypatch.setattr(pull, "pull_discord", lambda *a: {"threads": 1})
+    monkeypatch.setattr(pull, "pull_drive", lambda *a, **kw: {"files": 2})
+    monkeypatch.setattr(pull, "pull_discord", lambda *a, **kw: {"threads": 1})
     pull.pull(cfg(tmp_path), ("discord", "drive"), log=lambda _: None)
-    monkeypatch.setattr(pull, "pull_discord", lambda *a: {"threads": 5})
+    monkeypatch.setattr(pull, "pull_discord", lambda *a, **kw: {"threads": 5})
     pull.pull(cfg(tmp_path), ("discord",), log=lambda _: None)
 
     summary = json.loads((tmp_path / "raw" / "pull_summary.json").read_text())
     assert summary["discord"] == {"threads": 5}
     assert summary["drive"] == {"files": 2}
+
+
+def test_discord_pull_leaves_update_snapshots_and_member_cache(tmp_path, monkeypatch):
+    from kb.sources import discord as dsc
+
+    empty = dsc.DiscordPull(
+        server_id="1",
+        channel={"id": "100", "name": "feedback"},
+        channel_messages=[],
+        threads=[],
+        thread_messages={},
+    )
+
+    class Client:
+        def __init__(self, token):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+    monkeypatch.setattr(dsc, "DiscordClient", Client)
+    monkeypatch.setattr(dsc, "fetch_all", lambda *a, **kw: empty)
+    raw = tmp_path / "raw"
+    (raw / "discord" / "threads").mkdir(parents=True)
+    (raw / "discord" / "threads" / "old.json").write_text("{}")
+    (raw / "discord" / "2026-11-01.json").write_text("{}")
+    (raw / "discord" / "members.json").write_text("{}")
+
+    pull.pull_discord(cfg(tmp_path), raw, lambda _: None)
+    names = sorted(p.name for p in (raw / "discord").iterdir())
+    assert names == ["2026-11-01.json", "members.json", "messages", "threads"]
+    assert list((raw / "discord" / "threads").iterdir()) == []

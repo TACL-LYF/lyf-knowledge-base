@@ -8,8 +8,13 @@ Local only and a full read every time; nothing is written to Discord or Drive.
     ├── drive/<fileId>.md                  exported text, with metadata front matter
     └── pull_summary.json                  counts, every item with its link, errors
 
+Server nicknames already looked up are remembered in data/raw/discord/members.json
+(shared with `kb update`), so only new authors are looked up. `--refresh-names` looks
+everyone up again.
+
 Each source is written to a temporary directory first and swapped in only when it
-finishes, so a failed pull leaves the previous output in place.
+finishes, so a failed pull leaves the previous output in place. Only the pull's own
+subdirectories are replaced; `kb update`'s dated snapshots in discord/ are left alone.
 """
 
 from __future__ import annotations
@@ -22,11 +27,13 @@ from pathlib import Path
 from typing import Any
 
 from kb.config import Config
+from kb.progress import Stages
 from kb.sources import discord as dsc
 from kb.sources import drive as gdrive
 
 Log = Callable[[str], None]
 SOURCES = ("discord", "drive")
+MEMBER_CACHE = Path("raw") / "discord" / "members.json"  # relative to data_dir
 
 
 def _now() -> str:
@@ -51,38 +58,60 @@ def _write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def pull_discord(cfg: Config, raw_dir: Path, log: Log) -> dict[str, Any]:
-    with dsc.DiscordClient(cfg.discord_bot_token) as client:
-        pull = dsc.fetch_all(client, cfg.discord_server_id, cfg.discord_channel_id, log)
-    items = dsc.build_items(pull)
-
-    partial = _fresh_dir(raw_dir / ".discord.partial")
-    listed = []
-    for item in items:
-        if item["kind"] == "thread":
-            sub, key = "threads", item["thread_id"]
-        else:
-            sub, key = "messages", item["messages"][0]["id"]
-        rel = Path("discord") / sub / f"{key}.json"
-        _write_json(partial / sub / f"{key}.json", item)
-        listed.append(
-            {
-                "id": item["id"],
-                "title": item["title"],
-                "link": item["link"],
-                "messages": len(item["messages"]),
-                "path": rel.as_posix(),
-            }
+def pull_discord(
+    cfg: Config,
+    raw_dir: Path,
+    log: Log,
+    refresh_names: bool = False,
+    stages: Stages | None = None,
+) -> dict[str, Any]:
+    stages = stages or Stages(log, total=2)
+    cache = dsc.MemberCache(cfg.data_dir / MEMBER_CACHE)
+    with stages.stage("Reading Discord: the whole channel and every thread") as s:
+        with dsc.DiscordClient(cfg.discord_bot_token) as client:
+            pull = dsc.fetch_all(
+                client,
+                cfg.discord_server_id,
+                cfg.discord_channel_id,
+                s.detail,
+                member_cache=cache,
+                refresh_names=refresh_names,
+            )
+        items = dsc.build_items(pull)
+        for w in pull.warnings:
+            s.detail(f"warning: {w}")
+        threads = sum(1 for i in items if i["kind"] == "thread")
+        s.result = (
+            f"{threads} threads + {len(items) - threads} channel messages "
+            f"= {len(items)} items ({dsc.count_messages(items)} messages)"
         )
-    _swap_in(partial, raw_dir / "discord")
 
-    threads = sum(1 for i in items if i["kind"] == "thread")
-    for w in pull.warnings:
-        log(f"warning: {w}")
-    log(
-        f"Discord: {threads} threads + {len(items) - threads} channel messages "
-        f"= {len(items)} items ({dsc.count_messages(items)} messages)"
-    )
+    with stages.stage("Writing Discord items") as s:
+        partial = _fresh_dir(raw_dir / ".discord.partial")
+        listed = []
+        for item in items:
+            if item["kind"] == "thread":
+                sub, key = "threads", item["thread_id"]
+            else:
+                sub, key = "messages", item["messages"][0]["id"]
+            rel = Path("discord") / sub / f"{key}.json"
+            _write_json(partial / sub / f"{key}.json", item)
+            listed.append(
+                {
+                    "id": item["id"],
+                    "title": item["title"],
+                    "link": item["link"],
+                    "messages": len(item["messages"]),
+                    "path": rel.as_posix(),
+                }
+            )
+        (raw_dir / "discord").mkdir(parents=True, exist_ok=True)
+        for sub in ("threads", "messages"):
+            (partial / sub).mkdir(exist_ok=True)
+            _swap_in(partial / sub, raw_dir / "discord" / sub)
+        partial.rmdir()
+        s.result = f"wrote {len(items)} files to {raw_dir / 'discord'}"
+
     return {
         "threads": threads,
         "channel_messages": len(items) - threads,
@@ -93,44 +122,70 @@ def pull_discord(cfg: Config, raw_dir: Path, log: Log) -> dict[str, Any]:
 
 
 def pull_drive(
-    cfg: Config, raw_dir: Path, log: Log, services: gdrive.Services | None = None
+    cfg: Config,
+    raw_dir: Path,
+    log: Log,
+    services: gdrive.Services | None = None,
+    stages: Stages | None = None,
 ) -> dict[str, Any]:
-    services = services or gdrive.Services.from_key(cfg.google_credentials_path)
-    files = list(
-        gdrive.list_folder_files(services.drive, cfg.drive_source_folder_ids, cfg.drive_file_types)
-    )
-    log(f"Drive: {len(files)} in-scope files in {len(cfg.drive_source_folder_ids)} folder(s)")
+    stages = stages or Stages(log, total=3)
+    with stages.stage("Connecting to Google Drive") as s:
+        if services is None:
+            services = gdrive.Services.from_key(cfg.google_credentials_path)
+            s.result = f"signed in as {gdrive.service_account_email(cfg.google_credentials_path)}"
 
-    partial = _fresh_dir(raw_dir / ".drive.partial")
-    listed, errors = [], []
-    by_type: dict[str, int] = {}
-    for n, f in enumerate(files, 1):
-        meta = gdrive.file_metadata(f)
-        try:
-            body = gdrive.export_text(services, f)
-        except Exception as e:  # one bad file shouldn't stop the pull
-            msg = f"{type(e).__name__}: {e}"
-            errors.append(
-                {"id": meta["id"], "title": meta["title"], "link": meta["link"], "error": msg}
-            )
-            log(f"  error exporting '{meta['title']}': {msg}")
-        else:
-            (partial / f"{f['id']}.md").write_text(gdrive.render_file(f, body), encoding="utf-8")
-            by_type[meta["source"]] = by_type.get(meta["source"], 0) + 1
-            listed.append({**meta, "path": f"drive/{f['id']}.md"})
-        if n % 25 == 0 or n == len(files):
-            log(f"  exported {n}/{len(files)}")
-    _swap_in(partial, raw_dir / "drive")
+    folders = cfg.drive_source_folder_ids
+    with stages.stage(f"Listing files in {len(folders)} source folder(s), with subfolders") as s:
+        files = list(
+            gdrive.list_folder_files(services.drive, folders, cfg.drive_file_types, s.detail)
+        )
+        counts: dict[str, int] = {}
+        for f in files:
+            kind = gdrive.SOURCE_TYPE.get(f["mimeType"], f["mimeType"])
+            counts[kind] = counts.get(kind, 0) + 1
+        s.result = f"{len(files)} in-scope files" + (
+            " (" + ", ".join(f"{v} {k}" for k, v in sorted(counts.items())) + ")" if counts else ""
+        )
 
-    log(
-        f"Drive: {len(listed)} exported ("
-        + ", ".join(f"{v} {k}" for k, v in sorted(by_type.items()))
-        + f"), {len(errors)} errors"
-    )
+    with stages.stage(f"Exporting {len(files)} Drive files") as s:
+        partial = _fresh_dir(raw_dir / ".drive.partial")
+        listed, errors = [], []
+        by_type: dict[str, int] = {}
+        width = len(str(len(files)))
+        for n, f in enumerate(files, 1):
+            meta = gdrive.file_metadata(f)
+            label = f"({n:>{width}}/{len(files)}) {meta['title']}"
+            try:
+                body = gdrive.export_text(services, f)
+            except Exception as e:  # one bad file shouldn't stop the pull
+                msg = f"{type(e).__name__}: {e}"
+                errors.append(
+                    {"id": meta["id"], "title": meta["title"], "link": meta["link"], "error": msg}
+                )
+                s.detail(f"{label}: error: {msg}")
+            else:
+                (partial / f"{f['id']}.md").write_text(
+                    gdrive.render_file(f, body), encoding="utf-8"
+                )
+                by_type[meta["source"]] = by_type.get(meta["source"], 0) + 1
+                listed.append({**meta, "path": f"drive/{f['id']}.md"})
+                s.detail(f"{label}: ok")
+        _swap_in(partial, raw_dir / "drive")
+        s.result = (
+            f"{len(listed)} exported ("
+            + ", ".join(f"{v} {k}" for k, v in sorted(by_type.items()))
+            + f"), {len(errors)} errors, written to {raw_dir / 'drive'}"
+        )
+
     return {"files": len(listed), "by_type": by_type, "items": listed, "errors": errors}
 
 
-def pull(cfg: Config, sources: tuple[str, ...] = SOURCES, log: Log = print) -> dict[str, Any]:
+def pull(
+    cfg: Config,
+    sources: tuple[str, ...] = SOURCES,
+    log: Log = print,
+    refresh_names: bool = False,
+) -> dict[str, Any]:
     """Pull the given sources into data/raw/ and write pull_summary.json."""
     raw_dir = cfg.data_dir / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -142,12 +197,15 @@ def pull(cfg: Config, sources: tuple[str, ...] = SOURCES, log: Log = print) -> d
         except json.JSONDecodeError:
             summary = {}
 
+    total = 2 * ("discord" in sources) + 3 * ("drive" in sources)
+    stages = Stages(log, total=total)
+    log(f"kb pull ({', '.join(sources)}): full read into {raw_dir}, nothing is written to Drive")
     summary["started_at"] = _now()
     if "discord" in sources:
-        summary["discord"] = pull_discord(cfg, raw_dir, log)
+        summary["discord"] = pull_discord(cfg, raw_dir, log, refresh_names, stages=stages)
     if "drive" in sources:
-        summary["drive"] = pull_drive(cfg, raw_dir, log)
+        summary["drive"] = pull_drive(cfg, raw_dir, log, stages=stages)
     summary["finished_at"] = _now()
     _write_json(summary_path, summary)
-    log(f"Wrote {raw_dir}")
+    log(f"Wrote {summary_path.name}. Finished in {stages.elapsed():.1f}s.")
     return summary

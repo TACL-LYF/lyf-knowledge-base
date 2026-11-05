@@ -1,7 +1,6 @@
 """Google Drive source: list files in the source folders and export their text.
 
-Only the direct children of each source folder are read for now; recursive listing
-comes in M2, along with the manifest comparison.
+Each source folder is read recursively: files in its subfolders count too.
 
 Exporters (each returns markdown):
 - Docs   → Drive's built-in markdown export
@@ -11,7 +10,7 @@ Exporters (each returns markdown):
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -78,7 +77,7 @@ class Services:
 def list_children(
     drive: Any, folder_id: str, *, page_size: int = 100, page_token: str | None = None
 ) -> dict[str, Any]:
-    """One page of the direct children of a folder (not recursive)."""
+    """One page of the direct children of a folder (files and subfolders)."""
     return (
         drive.files()
         .list(
@@ -94,29 +93,47 @@ def list_children(
 
 
 def list_folder_files(
-    drive: Any, folder_ids: Iterable[str], mime_types: Iterable[str] | None = None
+    drive: Any,
+    folder_ids: Iterable[str],
+    mime_types: Iterable[str] | None = None,
+    log: Callable[[str], None] = lambda _: None,
 ) -> Iterator[dict[str, Any]]:
-    """Every file directly inside any of the folders (subfolders are skipped, not entered).
+    """Every file inside any of the folders, including files in their subfolders.
 
-    A file reachable from more than one folder is returned once. If mime_types is
-    given, only files of those types are returned.
+    A file reachable from more than one folder is returned once, and a folder reached
+    twice is only read once. If mime_types is given, only files of those types are
+    returned. Progress (folders read, files found) is logged every 10 folders.
     """
     wanted = set(mime_types) if mime_types is not None else None
-    seen: set[str] = set()
-    for folder_id in folder_ids:
+    seen_files: set[str] = set()
+    seen_folders: set[str] = set()
+    queue = list(folder_ids)
+    while queue:
+        folder_id = queue.pop(0)
+        if folder_id in seen_folders:
+            continue
+        seen_folders.add(folder_id)
         token: str | None = None
         while True:
             page = list_children(drive, folder_id, page_size=1000, page_token=token)
             for f in page.get("files", []):
-                if f["mimeType"] == FOLDER_MIME or f["id"] in seen:
+                if f["mimeType"] == FOLDER_MIME:
+                    queue.append(f["id"])
+                    continue
+                if f["id"] in seen_files:
                     continue
                 if wanted is not None and f["mimeType"] not in wanted:
                     continue
-                seen.add(f["id"])
+                seen_files.add(f["id"])
                 yield f
             token = page.get("nextPageToken")
             if not token:
                 break
+        if len(seen_folders) % 10 == 0 or not queue:
+            log(
+                f"folders read: {len(seen_folders)} ({len(queue)} queued), "
+                f"in-scope files found: {len(seen_files)}"
+            )
 
 
 def get_file(drive: Any, file_id: str, fields: str = FILE_FIELDS) -> dict[str, Any]:

@@ -95,3 +95,31 @@ def test_render_file_has_front_matter_and_owner_fallback():
     assert meta["source"] == "sheet"
     assert meta["owner"] == "Dee"
     assert rest == "\n# Feedback: Oct\n\nbody\n"
+
+
+def test_listing_reads_subfolders_once_and_dedupes(monkeypatch):
+    from kb.sources import drive as gdrive
+
+    tree = {
+        "root": [
+            {"id": "sub", "mimeType": gdrive.FOLDER_MIME},
+            {"id": "a", "mimeType": gdrive.DOC_MIME},
+            {"id": "pdf", "mimeType": "application/pdf"},
+        ],
+        "sub": [
+            {"id": "b", "mimeType": gdrive.SHEET_MIME},
+            {"id": "root", "mimeType": gdrive.FOLDER_MIME},  # cycle via a shortcut-like link
+            {"id": "a", "mimeType": gdrive.DOC_MIME},  # same file in two folders
+        ],
+        "other": [{"id": "sub", "mimeType": gdrive.FOLDER_MIME}],
+    }
+    calls = []
+
+    def children(drive, folder_id, *, page_size=100, page_token=None):
+        calls.append(folder_id)
+        return {"files": tree[folder_id]}
+
+    monkeypatch.setattr(gdrive, "list_children", children)
+    files = gdrive.list_folder_files(None, ["root", "other"], [gdrive.DOC_MIME, gdrive.SHEET_MIME])
+    assert [f["id"] for f in files] == ["a", "b"]
+    assert sorted(calls) == ["other", "root", "sub"]
