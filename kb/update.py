@@ -356,10 +356,14 @@ class DriveChanges:
     modified: list[dict[str, Any]] = field(default_factory=list)  # modified since last run
     skipped: list[dict[str, Any]] = field(default_factory=list)  # not modified since last run
     removed: list[str] = field(default_factory=list)  # manifest IDs no longer listed
+    # of `modified`: files not edited since the last run, listed only to be extracted
+    not_edited: set[str] = field(default_factory=set)
     # filled in after export:
     exported: dict[str, str] = field(default_factory=dict)  # file ID → body
     changed: list[dict[str, Any]] = field(default_factory=list)  # modified and text differs
     unchanged: list[dict[str, Any]] = field(default_factory=list)  # modified but text same
+    # same text as last time, but not extracted yet (pending, or its extraction failed):
+    waiting: list[dict[str, Any]] = field(default_factory=list)
     errors: dict[str, str] = field(default_factory=dict)  # file ID → error message
 
 
@@ -391,16 +395,16 @@ def classify_drive(
             out.new.append(f)
             continue
         modified = st.parse_time(f.get("modifiedTime"))
-        if (
-            full
-            or entry.get("status") in ("error", "pending")
+        edited = full or since is None or modified is None or modified > since
+        if edited:
+            out.modified.append(f)
+        elif (
+            entry.get("status") in ("error", "pending")
             or needs_extraction(entry)
             or (entry.get("status") == "skipped" and retry_skipped(f["id"], entry))
-            or since is None
-            or modified is None
-            or modified > since
         ):
             out.modified.append(f)
+            out.not_edited.add(f["id"])
         else:
             out.skipped.append(f)
     out.removed = [
@@ -434,13 +438,15 @@ def export_drive(
             changes.exported[f["id"]] = body
             if f["id"] in modified_ids:
                 entry = manifest.get(f"drive:{f['id']}") or {}
-                same = (
-                    entry.get("status") == "ok"
-                    and not needs_extraction(entry)
-                    and entry.get("content_hash") == content_hash(body)
-                )
-                (changes.unchanged if same else changes.changed).append(f)
-                log(f"{label}: {'same text, skipped' if same else 'changed'}")
+                if entry.get("content_hash") != content_hash(body):
+                    changes.changed.append(f)
+                    log(f"{label}: changed")
+                elif entry.get("status") == "ok" and not needs_extraction(entry):
+                    changes.unchanged.append(f)
+                    log(f"{label}: same text, skipped")
+                else:  # listed because it still needs extracting, not because it changed
+                    changes.waiting.append(f)
+                    log(f"{label}: same text, waiting for extraction")
             else:
                 log(f"{label}: new")
 
@@ -505,8 +511,10 @@ def save_raw(
 
     Discord: one file per day, `discord/YYYY-MM-DD.json`, holding every run that day (by
     anyone: the copy in Drive is read first, so teammates' runs aren't overwritten).
-    Drive: `drive/<fileId>.md`, the latest export of each new or changed file. With
-    `--full`, every exported file is written, so `raw/drive/` is filled in completely.
+    Drive: `drive/<fileId>.md`, the latest export of each new or changed file. Files
+    still waiting for extraction with the same text are only written if raw/drive/ has
+    no copy yet. With `--full`, every exported file is written, so `raw/drive/` is
+    filled in completely.
     """
     raw_dir = cfg.data_dir / "raw"
     remote_raw = kb_folder.subfolder(st.RAW_FOLDER)
@@ -537,8 +545,11 @@ def save_raw(
         local.write_text(text, encoding="utf-8")
         remote_discord.write(local.name, text.encode("utf-8"))
 
-    unchanged = {f["id"] for f in drive.unchanged}
-    to_write = [fid for fid in drive.exported if run["full"] or fid not in unchanged]
+    same_text = {f["id"] for f in drive.unchanged + drive.waiting}
+    to_write = [fid for fid in drive.exported if run["full"] or fid not in same_text]
+    if drive.waiting and not run["full"]:  # e.g. pulled before snapshots were uploaded
+        saved = _RemoteSnapshots(kb_folder)
+        to_write += [f["id"] for f in drive.waiting if not saved.has(f["id"])]
     if to_write:
         (raw_dir / "drive").mkdir(parents=True, exist_ok=True)
         remote_drive = remote_raw.subfolder("drive")
@@ -630,7 +641,7 @@ def build_items(
         )
         for i in [*discord.items, *retried]
     ]
-    for f in drive.new + drive.changed:
+    for f in drive.new + drive.changed + drive.waiting:
         if f["id"] in drive.exported:
             items.append(ext.drive_item(gdrive.file_metadata(f), drive.exported[f["id"]]))
     return items
@@ -1045,7 +1056,8 @@ def _pull(
         )
         s.result = (
             f"{_plural(len(files), 'file')}: {len(drive.new)} new, "
-            f"{len(drive.modified)} modified since the last run or not yet extracted, "
+            f"{len(drive.modified) - len(drive.not_edited)} modified since the last run, "
+            f"{len(drive.not_edited)} not yet extracted (or retried), "
             f"{len(drive.skipped)} unchanged, {len(drive.removed)} removed"
         )
 
@@ -1060,6 +1072,7 @@ def _pull(
             s.result = (
                 f"{len(drive.new)} new, {len(drive.changed)} changed, "
                 f"{len(drive.unchanged)} with the same text (skipped), "
+                f"{len(drive.waiting)} with the same text waiting for extraction, "
                 f"{_plural(len(drive.errors), 'error')}{retries.summary()}"
             )
     return pull, discord, retried, drive, files_by_id
@@ -1188,6 +1201,7 @@ def summarize(r: RunResult) -> dict[str, Any]:
             "new": len(g.new),
             "changed": len(g.changed),
             "unchanged_text": len(g.unchanged),
+            "waiting": len(g.waiting),
             "skipped": len(g.skipped),
             "removed": len(g.removed),
             "errors": len(g.errors),
@@ -1242,8 +1256,8 @@ def report(r: RunResult, manifest: dict[str, dict[str, Any]], log: Log, limit: i
 
         log(
             f"Drive: {g['new']} new, {g['changed']} changed, {g['unchanged_text']} modified "
-            f"with the same text (skipped), {g['skipped']} unchanged, {g['removed']} removed, "
-            f"{g['errors']} errors"
+            f"with the same text (skipped), {g['waiting']} waiting for extraction (same "
+            f"text), {g['skipped']} unchanged, {g['removed']} removed, {g['errors']} errors"
         )
         listing("  New:", [f.get("name", f["id"]) for f in r.drive.new])
         listing("  Changed:", [f.get("name", f["id"]) for f in r.drive.changed])
