@@ -503,10 +503,24 @@ def run_update(
             s.result = f"uploaded {', '.join(uploaded)}"
         return result
     finally:
-        if lock.file_id is not None:
-            lock.release()
-            log("Run lock released.")
+        _release(lock, log)
         log(f"Finished in {stages.elapsed():.1f}s.")
+
+
+def _release(lock: st.Lock, log: Log) -> None:
+    """Release the lock without letting a failure hide how the run itself went."""
+    if lock.file_id is None:
+        return
+    try:
+        lock.release()
+    except Exception as e:
+        log(
+            f"warning: the run lock couldn't be released ({type(e).__name__}: {e}). "
+            "Everything above still applies. The next run will report the lock as held; "
+            "once it's stale, clear it with `kb update --force-unlock`."
+        )
+    else:
+        log("Run lock released.")
 
 
 # ---------------------------------------------------------------------------

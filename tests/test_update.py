@@ -419,3 +419,35 @@ def test_progress_marks_the_failed_stage(world):
     assert len(failed) == 1 and failed[0].endswith("s: crash")
     assert "Listing Drive files" in lines[lines.index(failed[0]) - 1]
     assert "Run lock released." in lines
+
+
+def test_failed_lock_release_is_a_warning_not_a_failed_run(world, monkeypatch):
+    world.discord.channel.append(msg(97))
+
+    def refuse(file_id):
+        raise RuntimeError("File not found")
+
+    monkeypatch.setattr(world.kb.subfolder(st.STATE_FOLDER), "trash_id", refuse)
+    lines = []
+    upd.run_update(world.cfg, log=lines.append, sources=world.sources(), clock=lambda: world.now)
+    assert any("couldn't be released" in line for line in lines)
+    assert world.state()["cursors"]["discord_channel"] == "97"  # the run still saved
+
+
+def test_drive_folder_trashes_instead_of_deleting():
+    calls = []
+
+    class Files:
+        def update(self, **kw):
+            calls.append(kw)
+            return self
+
+        def execute(self, num_retries=0):
+            return {}
+
+    class Drive:
+        def files(self):
+            return Files()
+
+    st.DriveFolder(Drive(), "folder").trash_id("abc")
+    assert calls == [{"fileId": "abc", "body": {"trashed": True}, "supportsAllDrives": True}]

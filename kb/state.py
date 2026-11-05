@@ -76,7 +76,8 @@ class RemoteFolder(Protocol):
     def create(self, name: str, data: bytes, mime: str = "application/json") -> str:
         """Always create a new file (even if one has this name); returns its ID."""
 
-    def delete_id(self, file_id: str) -> None: ...
+    def trash_id(self, file_id: str) -> None:
+        """Move a file to the trash (removes it from listings)."""
 
     def subfolder(self, name: str, create: bool = True) -> RemoteFolder | None:
         """The child folder with this name: created if missing, or None if `create=False`."""
@@ -163,10 +164,14 @@ class DriveFolder:
         )
         return f["id"]
 
-    def delete_id(self, file_id: str) -> None:
-        self.drive.files().delete(fileId=file_id, supportsAllDrives=True).execute(
-            num_retries=NUM_RETRIES
-        )
+    def trash_id(self, file_id: str) -> None:
+        # Trash rather than delete: in a Shared Drive, a Content manager can trash files
+        # but not delete them permanently (Drive answers a delete with 404 "File not
+        # found"). Trashed files are left out of every listing and Drive empties the
+        # Shared Drive trash after 30 days.
+        self.drive.files().update(
+            fileId=file_id, body={"trashed": True}, supportsAllDrives=True
+        ).execute(num_retries=NUM_RETRIES)
 
     def subfolder(self, name: str, create: bool = True) -> DriveFolder | None:
         found = self._query(f"name = '{_q(name)}' and mimeType = '{FOLDER_MIME}'")
@@ -215,7 +220,7 @@ class MemoryFolder:
         self.files.append({"id": fid, "name": name, "data": data, "createdTime": created})
         return fid
 
-    def delete_id(self, file_id: str) -> None:
+    def trash_id(self, file_id: str) -> None:
         self.files = [f for f in self.files if f["id"] != file_id]
 
     def subfolder(self, name: str, create: bool = True) -> MemoryFolder | None:
@@ -292,7 +297,7 @@ class Lock:
                     "crashed. Re-run with --force-unlock to clear it."
                 )
             for f in existing:
-                self.folder.delete_id(f["id"])
+                self.folder.trash_id(f["id"])
 
         info = {
             "holder": self.holder,
@@ -305,13 +310,13 @@ class Lock:
             key=lambda f: (f.get("createdTime") or "", f["id"]),
         )
         if locks and locks[0]["id"] != self.file_id:
-            self.folder.delete_id(self.file_id)
+            self.folder.trash_id(self.file_id)
             self.file_id = None
             raise LockError("Another run took the lock at the same moment. Try again.")
 
     def release(self) -> None:
         if self.file_id is not None:
-            self.folder.delete_id(self.file_id)
+            self.folder.trash_id(self.file_id)
             self.file_id = None
 
     def __enter__(self) -> Lock:
