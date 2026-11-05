@@ -7,6 +7,7 @@
     ├── citations.jsonl  running list of citations (kb/citations.py)
     ├── extracted.jsonl  saved records (kb/extract.py)
     ├── programming_types.json
+    ├── sessions.json    named sessions of per-session types (kb/extract.py)
     └── lock             held while a run is in progress
 
 Drive is the source of truth. A run takes the lock, downloads `_state/` into
@@ -40,6 +41,7 @@ STATE_FILES = (CURSORS, MANIFEST, RUN_LOG)
 CITATIONS = "citations.jsonl"
 EXTRACTED = "extracted.jsonl"
 PROGRAMMING_TYPES = "programming_types.json"
+SESSIONS = "sessions.json"
 
 RUN_LOG_KEEP = 200  # older run log entries are dropped
 

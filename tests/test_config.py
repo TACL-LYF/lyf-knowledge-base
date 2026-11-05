@@ -127,3 +127,11 @@ def test_extraction_settings(tmp_path):
 def test_bad_effort_is_rejected(tmp_path):
     with pytest.raises(ConfigError, match="extract_effort"):
         load_config(write(tmp_path, CONFIG + "  extract_effort: extreme\n"))
+
+
+def test_per_session_types_default_to_workshop_and_can_be_changed(tmp_path):
+    assert load_config(write(tmp_path, CONFIG)).per_session_types == ["Workshop"]
+    custom = CONFIG + "programming:\n  per_session_types: [Workshop, '  Speaker   Series ']\n"
+    assert load_config(write(tmp_path, custom)).per_session_types == ["Workshop", "Speaker Series"]
+    none = CONFIG + "programming:\n  per_session_types: []\n"
+    assert load_config(write(tmp_path, none)).per_session_types == []

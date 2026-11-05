@@ -44,6 +44,7 @@ def rec(**kw):
         "category": "feature_request",
         "sentiment": "negative",
         "info_type": None,
+        "session": None,
         "applies_to": "2023",
         "date_basis": "stated",
         "citations": ["5"],
@@ -52,9 +53,13 @@ def rec(**kw):
     return {**base, **kw}
 
 
-def check(records, item=None, types=None):
+def check(records, item=None, types=None, sessions=None, per_session=("Workshop",)):
     return ext.validate(
-        {"records": records}, item or discord_item(), types or ext.ProgrammingTypes()
+        {"records": records},
+        item or discord_item(),
+        types or ext.ProgrammingTypes(),
+        sessions,
+        per_session,
     )
 
 
@@ -334,3 +339,66 @@ def test_request_id_is_stable_and_batch_safe():
 
 def test_prompt_file_exists_for_the_current_version():
     assert "programming" in ext.system_prompt()
+
+
+def test_session_is_kept_only_for_per_session_types():
+    good, problems = check(
+        [
+            rec(programming_type="workshop", session="active  listening"),
+            rec(programming_type="Night Market", session="October Night Market"),
+            rec(programming_type="Workshop", session=None),
+        ]
+    )
+    assert [c.fields["session"] for c in good] == ["active listening", None, None]
+    assert any("cleared" in p for p in problems)
+    assert not any(p.endswith("dropped") for p in problems)
+
+
+def test_session_reuses_a_known_name_in_the_same_year_only():
+    sessions = ext.Sessions()
+    assert sessions.add("Workshop", "Active Listening", "2025", "now")
+    (a, b), _ = check(
+        [
+            rec(programming_type="Workshop", session="ACTIVE listening", applies_to="2025-03"),
+            rec(programming_type="Workshop", session="ACTIVE listening", applies_to="2024"),
+        ],
+        sessions=sessions,
+    )
+    assert a.fields["session"] == "Active Listening"
+    assert b.fields["session"] == "ACTIVE listening"  # a different year is a different session
+
+
+def test_sessions_keep_the_most_precise_date():
+    sessions = ext.Sessions()
+    assert sessions.add("Workshop", "Identity", "2025", "now")
+    assert not sessions.add("Workshop", "identity", "2025-03-14", "later")
+    assert sessions.add("Workshop", "Identity", "2024-05", "later")
+    assert sessions.rows[0]["date"] == "2025-03-14"
+    assert sessions.listing() == [
+        "- Workshop, 2024-05: Identity",
+        "- Workshop, 2025-03-14: Identity",
+    ]
+
+
+def test_guidance_is_a_program_info_type():
+    (c,), _ = check(
+        [
+            rec(
+                kind="program_info",
+                category=None,
+                sentiment=None,
+                programming_type="Workshop",
+                info_type="guidance",
+            )
+        ]
+    )
+    assert c.fields["info_type"] == "guidance" and c.fields["session"] is None
+
+
+def test_user_message_marks_per_session_types_and_lists_sessions():
+    sessions = ext.Sessions()
+    sessions.add("Workshop", "Active Listening", "2025-03-14", "now")
+    msg = ext.user_message(["Night Market"], "src", ["Workshop"], sessions)
+    assert "- Night Market\n- Workshop (per-session)" in msg
+    assert "- Workshop, 2025-03-14: Active Listening" in msg
+    assert "(none yet)" in ext.user_message([], "src")

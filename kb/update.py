@@ -587,6 +587,7 @@ def load_store(local_state: Any) -> ext.Store:
         records=ext.Records.load(local_state / st.EXTRACTED),
         citations=Citations.load(local_state / st.CITATIONS),
         types=ext.ProgrammingTypes.load(local_state / st.PROGRAMMING_TYPES),
+        sessions=ext.Sessions.load(local_state / st.SESSIONS),
     )
 
 
@@ -594,6 +595,7 @@ def save_store(store: ext.Store, local_state: Any) -> None:
     store.records.save(local_state / st.EXTRACTED)
     store.citations.save(local_state / st.CITATIONS)
     store.types.save(local_state / st.PROGRAMMING_TYPES)
+    store.sessions.save(local_state / st.SESSIONS)
 
 
 def build_items(
@@ -1142,6 +1144,8 @@ def report(r: RunResult, manifest: dict[str, dict[str, Any]], log: Log, limit: i
         )
         if x.new_types:
             log(f"  New programming types: {', '.join(x.new_types)}")
+        if x.new_sessions:
+            log(f"  New sessions: {', '.join(x.new_sessions)}")
         listing(
             "  Skipped (too large):", [f"{titles.get(k, k)}: {v}" for k, v in x.skipped.items()]
         )
@@ -1249,7 +1253,7 @@ def status_lines(state: st.State, lock: dict[str, Any] | None) -> list[str]:
         out.append(f"Last run's extraction: {u.line()}")
 
     store = load_store(state.dir)
-    out.extend(ext.status_lines(store.records, store.citations, store.types))
+    out.extend(ext.status_lines(store.records, store.citations, store.types, store.sessions))
     return out
 
 

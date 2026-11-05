@@ -22,6 +22,10 @@ llm: # see "Choosing models" in docs/PLAN.md
   max_item_tokens: 100000 # larger items (characters ÷ 4) are skipped and reported
   batch_min_requests: 20 # this many extraction requests or more go through the Batch API (half price)
 
+programming:
+  per_session_types: # types where each session has its own content; records name the session
+    - Workshop
+
 state:
   lock_timeout_minutes: 60 # a lock older than this is treated as stale
 

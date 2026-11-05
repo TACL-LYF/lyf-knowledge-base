@@ -25,6 +25,9 @@ DEFAULT_SYNTHESIS_MODEL = "claude-opus-5-5"
 DEFAULT_MAX_ITEM_TOKENS = 100_000
 DEFAULT_BATCH_MIN_REQUESTS = 20
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# Programming types where each occurrence has its own content (a workshop on one topic,
+# then another on a different one), so records name the session. See PLAN.md.
+DEFAULT_PER_SESSION_TYPES = ["Workshop"]
 
 
 class ConfigError(Exception):
@@ -44,6 +47,7 @@ class Config:
     llm_extract_effort: str | None = None  # None: the model's default
     llm_max_item_tokens: int = DEFAULT_MAX_ITEM_TOKENS
     llm_batch_min_requests: int = DEFAULT_BATCH_MIN_REQUESTS
+    per_session_types: list[str] = field(default_factory=lambda: list(DEFAULT_PER_SESSION_TYPES))
     lock_timeout_minutes: int = 60
     data_dir: Path = REPO_ROOT / "data"
 
@@ -99,6 +103,7 @@ def load_config(path: Path | None = None, env_file: Path | None = None) -> Confi
     drive = raw.get("drive") or {}
     llm = raw.get("llm") or {}
     state = raw.get("state") or {}
+    programming = raw.get("programming") or {}
     paths = raw.get("paths") or {}
 
     if "source_folder_id" in drive:
@@ -119,6 +124,13 @@ def load_config(path: Path | None = None, env_file: Path | None = None) -> Confi
             f"llm.extract_effort must be one of {', '.join(EFFORTS)} (or left out), not {effort!r}."
         )
 
+    per_session = programming.get("per_session_types")
+    per_session_types = (
+        list(DEFAULT_PER_SESSION_TYPES)
+        if per_session is None
+        else [" ".join(str(t).split()) for t in _id_list(per_session)]
+    )
+
     creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
 
     return Config(
@@ -133,6 +145,7 @@ def load_config(path: Path | None = None, env_file: Path | None = None) -> Confi
         llm_max_item_tokens=int(llm.get("max_item_tokens") or DEFAULT_MAX_ITEM_TOKENS),
         llm_batch_min_requests=int(llm.get("batch_min_requests") or DEFAULT_BATCH_MIN_REQUESTS),
         drive_allow_large_files=_id_list(drive.get("allow_large_files")),
+        per_session_types=per_session_types,
         lock_timeout_minutes=int(state.get("lock_timeout_minutes") or 60),
         data_dir=_resolve(str(paths.get("data_dir") or "data"), base),
         discord_bot_token=os.environ.get("DISCORD_BOT_TOKEN", "").strip(),

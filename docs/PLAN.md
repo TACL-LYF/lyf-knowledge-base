@@ -100,6 +100,12 @@ No config file lists the programming types. The LLM finds them, with this framin
   - match feedback to the program setup it was about (for example, "sold out early" complaints in 2023, under the one-night setup, and none in 2024, under the three-night setup)
   - label a theme **likely resolved** when its feedback stops after a program change, rather than listing it as a current problem
   - rank themes and pick executive-summary takeaways with recent feedback weighted above old feedback, so a theme with many complaints from 2022 doesn't outrank this year's problems
+- **Per-session types (workshops):** most programming types run the same way every year, so one description and one history cover them. Workshops don't: there are several each year, all just called "Workshop", and each is built around that year's themes, so its content doesn't carry over to the next year. Workshop stays one programming type, and records also carry a `session`: the specific workshop's title or topic (for example, "Active Listening").
+  - **Which types:** `programming.per_session_types` in `config.yaml` (default `[Workshop]`). The prompt marks those types in the type list, and code clears `session` on any other type, so the model can't split Night Market into one entry per year.
+  - **General vs. one session:** a record about workshops in general (how to lead one, things to keep in mind, "workshops always run long") has `session: null`. A record about one workshop (what it covered, how it went, feedback on it) names the session. The session plus the record's year (`applies_to`) places it.
+  - **Consistent names:** the prompt is given the sessions found so far (saved in `_state/sessions.json`, with each one's type, year, and date) and reuses a name when the source is about the same session. A session is identified by type, year, and name, since two years can each have a workshop with the same title. The saved date lets the model match a Discord message like "today's workshop was great" to the session held that day. Workshop feedback that can't be matched keeps `session: null` and a precise `applies_to`, and synthesis tries again by date.
+  - **Guidance:** advice for whoever runs a program next (how to lead it, lessons learned, what to prepare) is its own `program_info` kind, `info_type: guidance`. It's what the general Workshop section is mostly made of, and it's useful for every type, not just workshops. Advice that grew out of one session keeps that session.
+  - **Synthesis treats sessions differently:** only general facts (`session: null`) go into the snapshot comparison, so the 2023 and 2024 workshops covering different topics isn't reported as a program change. Feedback on one session isn't grouped into the type's themes or labeled **likely resolved** because that session never ran again; it goes in that session's section. When the same point comes up across several sessions ("three of the 2025 workshops ran over time"), synthesis lifts it into the general guidance and themes, citing each session.
 - **Cleanup:** if two names turn out to mean the same thing, synthesis can merge them and update the saved list. `kb status` shows each programming type and how many records it has, so odd ones are easy to spot.
 
 ## Citations
@@ -140,6 +146,7 @@ Knowledge Base/
     ├── citations.jsonl            # running list of all citations
     ├── extracted.jsonl            # saved records (feedback and program_info)
     ├── programming_types.json     # programming types found so far
+    ├── sessions.json              # named sessions of per-session types (workshops)
     ├── run_log.json               # history of runs
     └── lock                       # prevents two runs at once
 ```
@@ -205,6 +212,7 @@ Everything fetched is saved locally in `data/` (`data/raw/discord/YYYY-MM-DD.jso
   "kind": "feedback",
   "feedback": "Not enough food vendors; stalls sold out early",
   "programming_type": "Night Market", // or null
+  "session": null, // the specific session, only for per-session types (e.g. "Active Listening")
   "category": "feature_request", // bug | feature_request | confusion | praise | other
   "sentiment": "negative",
   "applies_to": "2023-10", // the period the feedback is about (see below)
@@ -214,7 +222,7 @@ Everything fetched is saved locally in `data/` (`data/raw/discord/YYYY-MM-DD.jso
 }
 ```
 
-A `program_info` record has the same IDs, `kind`, `programming_type` (required, never `null`), `citations`, and `first_seen`, but no `feedback`, `category`, or `sentiment`. A `description` fact describes the setup during the period in `applies_to`. A `history` fact describes a change or a one-time event:
+A `program_info` record has the same IDs, `kind`, `programming_type` (required, never `null`), `session`, `citations`, and `first_seen`, but no `feedback`, `category`, or `sentiment`. A `description` fact describes the setup during the period in `applies_to` (for one session, also what it covered). A `history` fact describes a change or a one-time event. A `guidance` fact is advice for whoever runs it next:
 
 ```json
 {
@@ -222,13 +230,20 @@ A `program_info` record has the same IDs, `kind`, `programming_type` (required, 
   "item_id": "drive:1AbCdEfGhIjKlMnOp",
   "kind": "program_info",
   "fact": "Night Market moved from the courtyard to the north parking lot to fit more vendors",
-  "info_type": "history", // description | history
+  "info_type": "history", // description | history | guidance
   "applies_to": "2025-09", // the period the fact is true for, as precise as the source allows (YYYY, YYYY-MM, or YYYY-MM-DD)
   "date_basis": "stated", // stated | inferred | source_date
   "programming_type": "Night Market",
+  "session": null,
   "citations": ["C-0311"],
   "first_seen": "2026-11-04T09:00:00Z"
 }
+```
+
+`session` is `null` for every type not in `programming.per_session_types`, and for records about a per-session type in general. Sessions are saved in `_state/sessions.json`:
+
+```json
+[{ "programming_type": "Workshop", "name": "Active Listening", "year": "2025", "date": "2025-03-14", "first_seen": "2026-11-04T09:00:00Z" }]
 ```
 
 Both kinds also carry `quote` (a short verbatim excerpt from the source supporting the record, or `null`, used by synthesis to pick quotes), `prompt_version`, and `model`.
@@ -250,6 +265,7 @@ Every record, of either kind, has `applies_to` and `date_basis`. For feedback, `
 3. Executive summary (top takeaways across programming types and themes, weighted toward recent feedback)
 4. **Programming types**, ordered by amount of feedback, with recent feedback weighted higher. For each type:
    - A short summary, plus what's working and what to improve
+   - For a per-session type, only general feedback (and points that came up across several sessions) is grouped into themes; feedback on one session lives in that session's section of Programs, linked from here by year
    - Themes, each with a description, citation count, a breakdown by year (for example, "2023: 12 · 2024: 3"), the most recent date it was mentioned, 2–3 quotes with authors (recent ones preferred), and the full list of citation markers. A theme whose feedback stopped after a program change is labeled **likely resolved**, with the change it followed, and listed after current themes
 5. **Other themes** (feedback not tied to a programming type), ordered the same way, in the same format
 6. Feature requests · Bugs (collected across everything, with citations, the most recent date each was mentioned, and **likely resolved** labels)
@@ -265,7 +281,9 @@ Built from `program_info` records, plus a feedback summary for each period from 
 3. For each programming type:
    - **Description:** what it is, who it's for, and how it runs now (from the most recent snapshot), with citation markers
    - **History:** a timeline ordered by `applies_to`, with changes stated by a source and changes found by comparing snapshots, conflicting sources noted, and approximate (`source_date`) dates marked; each entry has citation markers, and a change found by comparison cites the sources on both sides
+   - **Running it:** `guidance` facts (how to lead it, lessons learned, what to prepare), with citation markers. For a per-session type, this includes points lifted from several sessions
    - **Feedback by period:** for each setup in the history, two or three sentences on the feedback about that period (for example, what people said about the one-night setup in 2023 compared with the three-night setup in 2024), and a link to that type's section in Consolidated Feedback
+   - For a per-session type, **By year** in place of feedback by period: for each year, newest first, each session with what it covered, guidance from it, its feedback (summary, quotes, and citation markers), then "Other workshop feedback, 2025" for feedback that couldn't be matched to a session. Description and History cover only the general facts
 4. Appendix: citations used in the doc
 
 ## Choosing models
@@ -397,6 +415,7 @@ Before the first full run, cut the text sent to the LLM down to what matters. A 
   - `feedback`: feedback, programming type or `null`, category, sentiment, `applies_to` and `date_basis` (the period the feedback is about, not when it was given), and citations (Discord message IDs, or the file)
   - `program_info`: a description or history fact, `info_type`, `applies_to` and `date_basis`, programming type (required), and citations. The prompt asks for the period each fact is true for, using what the source says or clues such as the file name and message date, and to use `source_date` only when there are no clues
 - [x] Give the prompt the saved list of programming types, and add new types to `programming_types.json`
+- [x] Per-session types (`programming.per_session_types`, default `[Workshop]`): records get `session`, the prompt is given the sessions found so far and marks which types are per-session, new sessions are added to `sessions.json`, and `session` is cleared on other types. `program_info` gets `info_type: guidance`. `kb status` shows each per-session type's number of sessions and its records not tied to one
 - [x] Check every record: it must have at least one citation, each cited Discord message must exist in the item, `program_info` records must name a programming type, and every record must have an `applies_to` in `YYYY`, `YYYY-MM`, or `YYYY-MM-DD` form. If `date_basis` is `source_date`, `applies_to` is set from the citation's date in code, not taken from the model
 - [x] New messages in an old thread: extract only those, with earlier messages as context
 - [x] Retries, plus per-item `error` status so one failure doesn't stop the run
@@ -404,7 +423,7 @@ Before the first full run, cut the text sent to the LLM down to what matters. A 
 - [x] `kb status`: records per year, and the share with `date_basis: source_date`, so weak dating is easy to spot
 - [x] Steps: `kb update` runs every step by default; `--pull` and `--extract` run one (M4 adds `--synthesize`). Items pulled but not extracted get status `pending`; Discord items keep their messages in the manifest, and `--extract` reads Drive files from `raw/drive/`. `--limit N` extracts at most N items, for a small first run
 
-**Done when:** no exported Doc contains base64 image data; `--dry-run` shows token and cost estimates, and a file over the size limit is skipped and reported unless it's allowed in config; a full first run extracts records for every item that isn't skipped; a person checks about 20 records to confirm the feedback and program facts are accurate, the programming type makes sense, records have the right `applies_to` (including feedback about a past year), and each citation link opens the right message or file; the programming types list has no obvious duplicates; and a second run makes 0 LLM calls.
+**Done when:** no exported Doc contains base64 image data; `--dry-run` shows token and cost estimates, and a file over the size limit is skipped and reported unless it's allowed in config; a full first run extracts records for every item that isn't skipped; a person checks about 20 records to confirm the feedback and program facts are accurate, the programming type makes sense, records have the right `applies_to` (including feedback about a past year), and each citation link opens the right message or file; the programming types list has no obvious duplicates; workshop records split sensibly between general (how to lead, things to keep in mind) and specific sessions, two workshops in the same year show up as separate sessions, and `sessions.json` has no obvious duplicates; and a second run makes 0 LLM calls.
 
 ### M3.5: Faster Drive exports
 
@@ -425,13 +444,14 @@ Exporting Drive files one at a time is slow, and nearly all of that time is spen
 - [ ] Likely-resolved check: for each theme tied to a programming type, compare when its feedback stops with the program's history, and label it **likely resolved** if it stopped after a change. Apply the same check to feature requests and bugs
 - [ ] Give synthesis the previous run's type and theme names so the structure stays stable between runs
 - [ ] Render the markdown doc in the structure above, with citation markers on every feedback point and the citations appendix
-- [ ] Programs synthesis: for each programming type, sort its `program_info` records by `applies_to`, treat `description` facts as dated snapshots, and compare snapshots from different periods to find changes no source states outright. Write the current description from the latest snapshot, a history timeline that merges stated and found changes (each found change cites both sides), notes on conflicting sources, and a feedback summary for each period of the history
+- [ ] Per-session types: keep feedback with a `session` out of the type's themes and the likely-resolved check, and group it by year and session instead. Match workshop feedback with no `session` to a session by date where possible. Lift points that come up across several sessions into the general themes and guidance, citing each session
+- [ ] Programs synthesis: for each programming type, sort its `program_info` records by `applies_to`, treat `description` facts as dated snapshots (only general ones, `session: null`, for a per-session type), and compare snapshots from different periods to find changes no source states outright. Write the current description from the latest snapshot, a history timeline that merges stated and found changes (each found change cites both sides), notes on conflicting sources, a feedback summary for each period of the history, and a **Running it** section from `guidance` facts. For a per-session type, write **By year** sections with each session's content, guidance, and feedback
 - [ ] Render the Programs doc in the structure above, with citation markers and links to and from Consolidated Feedback
 - [ ] `publish.py`: create each doc on the first run, then update it in place with `files.update`, and save both doc IDs in state
 - [ ] Write the Citations sheet from `citations.jsonl`, and its Records tab from `extracted.jsonl`
 - [ ] Citation links: render every `[C-0042]` marker in both docs, and each entry in the citations appendices, as a markdown link to the citation's saved `link` (the Discord message link or the Drive file's `webViewLink`), so the upload in `files.update` turns them into clickable links. Make the Citations sheet's link column clickable too. A `removed` citation shows as plain text with "(removed)" instead of a dead link. Discord links open only for server members who can see that channel, and Drive links follow each file's sharing settings; say so in the appendix
 
-**Done when:** both docs exist in Drive and every feedback point and program fact has working citation links; each programming type in Programs has a description and a history in date order; a test programming type whose 2023 and 2024 docs describe different setups, with no source mentioning the change, shows that change in its history with citations to both docs; a theme whose feedback stops after a program change is labeled **likely resolved**; the Records tab can be filtered to one year; the Citations sheet lists every citation; and after adding one new piece of feedback and re-running, it shows up under "New since last update" with a new citation ID while existing IDs and both doc links stay the same.
+**Done when:** both docs exist in Drive and every feedback point and program fact has working citation links; each programming type in Programs has a description and a history in date order; a test programming type whose 2023 and 2024 docs describe different setups, with no source mentioning the change, shows that change in its history with citations to both docs; a theme whose feedback stops after a program change is labeled **likely resolved**; two workshops from different years on different topics appear as separate sessions under By year, not as a change in Workshop's history, and feedback on one of them isn't labeled likely resolved; the Records tab can be filtered to one year; the Citations sheet lists every citation; and after adding one new piece of feedback and re-running, it shows up under "New since last update" with a new citation ID while existing IDs and both doc links stay the same.
 
 ### M5: Hardening and handoff
 
@@ -459,6 +479,7 @@ Exporting Drive files one at a time is slow, and nearly all of that time is spen
 | Slides speaker notes      | Included (Slides API)                                                                                                                                                                            |
 | How feedback is organized | By programming type (found by the LLM, no config), then themes; other feedback goes into LLM-found themes                                                                                        |
 | Program descriptions and history | Extracted as `program_info` records alongside feedback, in the same pass; published as a separate **Programs** doc (not a tab, because the markdown upload in `files.update` can't target Docs tabs). Every fact is dated (`applies_to`, `date_basis`); synthesis finds changes by comparing dated snapshots |
+| Workshops (per-session types) | One programming type, with a `session` field naming the specific workshop. Types are listed in `programming.per_session_types` (default `[Workshop]`). General content (how to lead, things to keep in mind) has `session: null`; each session's content and feedback is grouped by year and session in Programs, and kept out of the general themes, snapshot comparison, and likely-resolved labels. Advice is its own `info_type`, `guidance` |
 | Dating feedback | Every feedback record has `applies_to` (the period it's about, not when it was given) and `date_basis`, like program facts. Used for year breakdowns, matching feedback to program setups, **likely resolved** labels, and weighting recent feedback higher. The Citations sheet's Records tab allows filtering by year |
 | Discord conversations     | One per thread; main-channel messages outside threads are separate items; no time-based grouping                                                                                                 |
 | Discord incremental reads | Message-ID cursors per channel and thread. The first run reads everything automatically. `--full` is used rarely, only for a full reload; otherwise later edits and deletions are not picked up. |

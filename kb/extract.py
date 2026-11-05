@@ -6,18 +6,20 @@ For each new or changed item (a Discord thread or channel message, or a Drive fi
    reported, unless their file ID is in `drive.allow_large_files`. Allowed large files
    are split into chunks, each sent separately but cited as the whole file.
 2. The item is rendered as text and sent to the extraction model with the versioned
-   prompt in `prompts/` and the programming types found so far. The model answers with
-   JSON matching `SCHEMA`.
+   prompt in `prompts/`, the programming types found so far, and the named sessions of
+   per-session types (`per_session_types` in config, such as Workshop). The model
+   answers with JSON matching `SCHEMA`.
 3. Every record is checked (see `validate`): it needs a citation, each cited Discord
    message must be one of the item's new messages, `program_info` needs a programming
    type, and `applies_to` must be `YYYY`, `YYYY-MM` or `YYYY-MM-DD`. When `date_basis`
    is `source_date`, `applies_to` is set here from the citation's date, not taken from
-   the model.
+   the model. `session` is kept only for per-session types, and reuses a known
+   session's name when one matches.
 4. A request that fails, or whose answer can't be read, is retried once. An item that
    still fails gets status `error` and is tried again next run; the rest of the run
    carries on.
-5. Records get permanent IDs (R-0001…) and citation IDs, and new programming types are
-   added to `programming_types.json`.
+5. Records get permanent IDs (R-0001…) and citation IDs, new programming types are
+   added to `programming_types.json`, and new sessions to `sessions.json`.
 """
 
 from __future__ import annotations
@@ -47,7 +49,7 @@ OUTPUT_TOKENS_RATIO = 0.10
 KINDS = ["feedback", "program_info"]
 CATEGORIES = ["bug", "feature_request", "confusion", "praise", "other"]
 SENTIMENTS = ["positive", "negative", "neutral", "mixed"]
-INFO_TYPES = ["description", "history"]
+INFO_TYPES = ["description", "history", "guidance"]
 DATE_BASES = ["stated", "inferred", "source_date"]
 
 
@@ -61,6 +63,7 @@ RECORD_SCHEMA: dict[str, Any] = {
         "kind": {"type": "string", "enum": KINDS},
         "text": {"type": "string"},
         "programming_type": _nullable({"type": "string"}),
+        "session": _nullable({"type": "string"}),
         "category": _nullable({"type": "string", "enum": CATEGORIES}),
         "sentiment": _nullable({"type": "string", "enum": SENTIMENTS}),
         "info_type": _nullable({"type": "string", "enum": INFO_TYPES}),
@@ -73,6 +76,7 @@ RECORD_SCHEMA: dict[str, Any] = {
         "kind",
         "text",
         "programming_type",
+        "session",
         "category",
         "sentiment",
         "info_type",
@@ -146,6 +150,82 @@ class ProgrammingTypes:
             return False
         self.rows.append({"name": name, "first_seen": now})
         return True
+
+
+def _norm(name: str) -> str:
+    return " ".join(name.lower().split())
+
+
+class Sessions:
+    """`_state/sessions.json`: the named sessions of per-session programming types.
+
+    [{"programming_type": "Workshop", "name": "Active Listening", "year": "2025",
+      "date": "2025-03-14", "first_seen": "..."}]
+
+    A session is identified by its type, year, and name (case and spacing ignored), since
+    two years can each have a workshop with the same title. `date` is the most precise
+    `applies_to` seen for it, so the model can match "today's workshop" to it.
+    """
+
+    def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
+        self.rows: list[dict[str, Any]] = list(rows or [])
+
+    @classmethod
+    def load(cls, path: Path) -> Sessions:
+        if not path.is_file():
+            return cls()
+        return cls(json.loads(path.read_text(encoding="utf-8")))
+
+    def save(self, path: Path) -> None:
+        text = json.dumps(self.rows, indent=2, ensure_ascii=False) + "\n"
+        path.write_text(text, encoding="utf-8")
+
+    def _find(self, ptype: str, year: str, name: str) -> dict[str, Any] | None:
+        for row in self.rows:
+            if (
+                _norm(row["programming_type"]) == _norm(ptype)
+                and row["year"] == year
+                and _norm(row["name"]) == _norm(name)
+            ):
+                return row
+        return None
+
+    def resolve(self, ptype: str, applies_to: str, name: str | None) -> str | None:
+        """The saved spelling of a session name for that type and year, else the name tidied."""
+        if name is None:
+            return None
+        name = " ".join(str(name).split())
+        if not name:
+            return None
+        row = self._find(ptype, applies_to[:4], name)
+        return row["name"] if row else name
+
+    def add(self, ptype: str, name: str, applies_to: str, now: str) -> bool:
+        """Add a new session, or sharpen a known one's date. True if it's new."""
+        row = self._find(ptype, applies_to[:4], name)
+        if row is not None:
+            if len(applies_to) > len(row.get("date") or ""):
+                row["date"] = applies_to
+            return False
+        self.rows.append(
+            {
+                "programming_type": ptype,
+                "name": name,
+                "year": applies_to[:4],
+                "date": applies_to,
+                "first_seen": now,
+            }
+        )
+        return True
+
+    def listing(self) -> list[str]:
+        """One line per session, for the prompt: type, year, then date and name."""
+        rows = sorted(
+            self.rows, key=lambda r: (r["programming_type"].lower(), r.get("date") or "", r["name"])
+        )
+        return [
+            f"- {r['programming_type']}, {r.get('date') or r['year']}: {r['name']}" for r in rows
+        ]
 
 
 class Records:
@@ -293,9 +373,31 @@ def item_texts(item: Item) -> list[str]:
     return [_drive_header(item.drive, (n, len(pieces))) + p for n, p in enumerate(pieces, 1)]
 
 
-def user_message(types: list[str], source_text: str) -> str:
-    listed = "\n".join(f"- {t}" for t in sorted(types, key=str.lower)) or "(none yet)"
-    return f"Programming types found so far:\n{listed}\n\n<source>\n{source_text}\n</source>"
+def _is_per_session(ptype: str | None, per_session: Iterable[str]) -> bool:
+    return bool(ptype) and _norm(ptype or "") in {_norm(t) for t in per_session}
+
+
+def user_message(
+    types: list[str],
+    source_text: str,
+    per_session: Iterable[str] = (),
+    sessions: Sessions | None = None,
+) -> str:
+    per_session = list(per_session)
+    names = sorted({*types, *per_session}, key=str.lower)
+    listed = (
+        "\n".join(
+            f"- {t}" + (" (per-session)" if _is_per_session(t, per_session) else "") for t in names
+        )
+        or "(none yet)"
+    )
+    known = (sessions.listing() if sessions else []) or ["(none yet)"]
+    return (
+        f"Programming types found so far:\n{listed}\n\n"
+        f"Sessions of per-session types found so far (type, date, name):\n"
+        + "\n".join(known)
+        + f"\n\n<source>\n{source_text}\n</source>"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -387,8 +489,16 @@ class Checked:
     message_ids: list[str]  # cited Discord messages (empty for Drive)
 
 
-def validate(raw: Any, item: Item, types: ProgrammingTypes) -> tuple[list[Checked], list[str]]:
+def validate(
+    raw: Any,
+    item: Item,
+    types: ProgrammingTypes,
+    sessions: Sessions | None = None,
+    per_session: Iterable[str] = (),
+) -> tuple[list[Checked], list[str]]:
     """Check the model's records for one request. Returns (good records, problems)."""
+    sessions = sessions or Sessions()
+    per_session = list(per_session)
     problems: list[str] = []
     if not isinstance(raw, dict) or not isinstance(raw.get("records"), list):
         raise ValueError("answer has no 'records' list")
@@ -448,6 +558,17 @@ def validate(raw: Any, item: Item, types: ProgrammingTypes) -> tuple[list[Checke
                 continue
             applies_to = known[0][:10]
 
+        # Session: only per-session types have one; reuse a known session's name
+        session = r.get("session")
+        if not _is_per_session(ptype, per_session):
+            if session:
+                problems.append(
+                    f"{where}: session {session!r} on a type that isn't per-session; cleared"
+                )
+            session = None
+        else:
+            session = sessions.resolve(ptype or "", applies_to, session)
+
         quote = r.get("quote")
         quote = " ".join(str(quote).split()) if quote else None
         if kind == "feedback":
@@ -469,7 +590,9 @@ def validate(raw: Any, item: Item, types: ProgrammingTypes) -> tuple[list[Checke
                 "info_type": info_type,
                 "programming_type": ptype,
             }
-        fields.update({"applies_to": applies_to, "date_basis": basis, "quote": quote})
+        fields.update(
+            {"session": session, "applies_to": applies_to, "date_basis": basis, "quote": quote}
+        )
         out.append(Checked(fields, message_ids))
     return out, problems
 
@@ -487,6 +610,7 @@ class ExtractResult:
     deferred: dict[str, str] = field(default_factory=dict)  # item ID → why it waits (--limit…)
     problems: dict[str, list[str]] = field(default_factory=dict)  # item ID → record problems
     new_types: list[str] = field(default_factory=list)
+    new_sessions: list[str] = field(default_factory=list)  # "Workshop 2025: Active Listening"
     usage: llm_mod.Usage = field(default_factory=llm_mod.Usage)
 
     @property
@@ -504,6 +628,7 @@ class ExtractResult:
                 1 for ps in self.problems.values() for p in ps if p.endswith("dropped")
             ),
             "new_programming_types": self.new_types,
+            "new_sessions": self.new_sessions,
             "usage": self.usage.to_dict(),
         }
 
@@ -515,6 +640,7 @@ class Store:
     records: Records
     citations: Citations
     types: ProgrammingTypes
+    sessions: Sessions = field(default_factory=Sessions)
 
 
 def _parse(text: str | None) -> Any:
@@ -554,7 +680,7 @@ def run(
     for item in todo:
         jobs[item.id] = []
         for text in item_texts(item):
-            user = user_message(types_now, text)
+            user = user_message(types_now, text, cfg.per_session_types, store.sessions)
             rid = llm_mod.request_id(
                 cfg.llm_extract_model, cfg.llm_extract_effort, system, user, SCHEMA
             )
@@ -578,7 +704,13 @@ def run(
             try:
                 if resp.error:
                     raise ValueError(resp.error)
-                answers[rid] = validate(_parse(resp.text), by_id[owner[rid]], store.types)
+                answers[rid] = validate(
+                    _parse(resp.text),
+                    by_id[owner[rid]],
+                    store.types,
+                    store.sessions,
+                    cfg.per_session_types,
+                )
                 failures.pop(rid, None)
             except (ValueError, json.JSONDecodeError) as e:
                 failures[rid] = str(e)
@@ -642,6 +774,9 @@ def save_item(
             c.fields["programming_type"] = ptype
             if store.types.add(ptype, now):
                 result.new_types.append(ptype)
+        session = c.fields.get("session")
+        if ptype and session and store.sessions.add(ptype, session, c.fields["applies_to"], now):
+            result.new_sessions.append(f"{ptype} {c.fields['applies_to'][:4]}: {session}")
         store.records.add(
             {
                 "item_id": item.id,
@@ -672,7 +807,12 @@ def mark_removed(
 # ---------------------------------------------------------------------------
 
 
-def status_lines(records: Records, citations: Citations, types: ProgrammingTypes) -> list[str]:
+def status_lines(
+    records: Records,
+    citations: Citations,
+    types: ProgrammingTypes,
+    sessions: Sessions | None = None,
+) -> list[str]:
     out: list[str] = []
     rows = records.rows
     kinds: dict[str, int] = {}
@@ -707,7 +847,16 @@ def status_lines(records: Records, citations: Citations, types: ProgrammingTypes
                 per[r["programming_type"]] = per.get(r["programming_type"], 0) + 1
         out.append(f"Programming types: {len(types.rows)}")
         for name in sorted(types.names, key=lambda n: (-per.get(n, 0), n.lower())):
-            out.append(f"  - {name}: {per.get(name, 0)} records")
+            line = f"  - {name}: {per.get(name, 0)} records"
+            named = [
+                s for s in (sessions.rows if sessions else []) if s["programming_type"] == name
+            ]
+            if named:
+                general = sum(
+                    1 for r in rows if r.get("programming_type") == name and not r.get("session")
+                )
+                line += f" ({len(named)} sessions; {general} records not tied to one)"
+            out.append(line)
     else:
         out.append("Programming types: none yet")
     return out

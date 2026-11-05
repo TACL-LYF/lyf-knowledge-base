@@ -590,6 +590,9 @@ def test_first_run_extracts_records_with_citations(world):
     assert cites[drive["citations"][0]]["source"] == "doc"
     types = json.loads(world.kb.subfolder(st.STATE_FOLDER).read(st.PROGRAMMING_TYPES))
     assert [t["name"] for t in types] == ["Night Market"]
+    # Night Market isn't per-session, so no record has a session and none are saved
+    assert all(r["session"] is None for r in records)
+    assert json.loads(world.kb.subfolder(st.STATE_FOLDER).read(st.SESSIONS)) == []
     m = world.state()["manifest"]
     assert all(e["prompt_version"] == 1 for e in m.values())
 
