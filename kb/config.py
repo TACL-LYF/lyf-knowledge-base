@@ -47,6 +47,7 @@ class Config:
     llm_extract_model: str = DEFAULT_EXTRACT_MODEL
     llm_synthesis_model: str = DEFAULT_SYNTHESIS_MODEL
     llm_extract_effort: str | None = None  # None: the model's default
+    llm_synthesis_effort: str | None = None
     llm_max_item_tokens: int = DEFAULT_MAX_ITEM_TOKENS
     llm_batch_min_requests: int = DEFAULT_BATCH_MIN_REQUESTS
     per_session_types: list[str] = field(default_factory=lambda: list(DEFAULT_PER_SESSION_TYPES))
@@ -120,11 +121,16 @@ def load_config(path: Path | None = None, env_file: Path | None = None) -> Confi
             "steps can use different models. Update config.yaml (see config.example.yaml)."
         )
 
-    effort = str(llm.get("extract_effort") or "").strip() or None
-    if effort is not None and effort not in EFFORTS:
-        raise ConfigError(
-            f"llm.extract_effort must be one of {', '.join(EFFORTS)} (or left out), not {effort!r}."
-        )
+    def _effort(key: str) -> str | None:
+        value = str(llm.get(key) or "").strip() or None
+        if value is not None and value not in EFFORTS:
+            raise ConfigError(
+                f"llm.{key} must be one of {', '.join(EFFORTS)} (or left out), not {value!r}."
+            )
+        return value
+
+    effort = _effort("extract_effort")
+    synthesis_effort = _effort("synthesis_effort")
 
     per_session = programming.get("per_session_types")
     per_session_types = (
@@ -154,6 +160,7 @@ def load_config(path: Path | None = None, env_file: Path | None = None) -> Confi
         llm_extract_model=str(llm.get("extract_model") or DEFAULT_EXTRACT_MODEL),
         llm_synthesis_model=str(llm.get("synthesis_model") or DEFAULT_SYNTHESIS_MODEL),
         llm_extract_effort=effort,
+        llm_synthesis_effort=synthesis_effort,
         llm_max_item_tokens=int(llm.get("max_item_tokens") or DEFAULT_MAX_ITEM_TOKENS),
         llm_batch_min_requests=int(llm.get("batch_min_requests") or DEFAULT_BATCH_MIN_REQUESTS),
         drive_allow_large_files=_id_list(drive.get("allow_large_files")),

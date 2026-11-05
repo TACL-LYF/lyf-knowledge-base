@@ -20,8 +20,9 @@ llm: # see "Choosing models" in docs/PLAN.md
   extract_model: claude-opus-5-5 # turns each item into records; mistakes are saved for good
   synthesis_model: claude-opus-5-5 # builds the docs every run; can be switched to a cheaper model
   # extract_effort: high # low | medium | high | xhigh | max; leave out for the model's default
+  # synthesis_effort: high # the same, for synthesis
   max_item_tokens: 100000 # larger items (characters ÷ 4) are skipped and reported
-  batch_min_requests: 20 # this many extraction requests or more go through the Batch API (half price)
+  batch_min_requests: 20 # this many requests or more (in one step) go through the Batch API (half price)
 
 programming:
   per_session_types: # types where each session has its own content; records name the session

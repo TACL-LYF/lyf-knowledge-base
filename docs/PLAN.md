@@ -147,6 +147,7 @@ Knowledge Base/
     ├── extracted.jsonl            # saved records (feedback and program_info)
     ├── programming_types.json     # programming types found so far
     ├── sessions.json              # named sessions of per-session types (workshops)
+    ├── synthesis.json             # doc IDs, last publish, each synthesis section's last answer
     ├── run_log.json               # history of runs
     └── lock                       # prevents two runs at once
 ```
@@ -317,8 +318,9 @@ lyf-knowledge-base/
 │   ├── pull.py          # M1: full read of both sources into data/raw/
 │   ├── update.py        # one `kb update` run: lock, read what's new, save raw + state
 │   ├── extract.py       # item → feedback records + citations
-│   ├── synthesize.py    # records → programming types/themes → markdown
-│   └── publish.py       # update doc and Citations sheet
+│   ├── synthesize.py    # records → programming types, themes, histories (LLM, cached per section)
+│   ├── render.py        # synthesis → markdown for both docs, rows for the Citations sheet
+│   └── publish.py       # create/update both docs, fix heading links, write the Citations sheet
 ├── prompts/             # versioned extraction and synthesis prompts
 ├── tests/
 ├── scripts/smoke_test.py  # M0: check Discord + Drive access with real credentials
@@ -340,6 +342,7 @@ kb update --dry-run   # show what's new or changed; no LLM calls, no writes
 kb update --full      # rare: read the whole Discord channel and export every Drive file again
 kb update --pull      # only the pull step; new items wait as `pending`
 kb update --extract   # only the extract step, for pending items (reads raw/ snapshots, not the sources)
+kb update --synthesize  # only rebuild and publish the docs from saved records, even if nothing changed
 kb update --limit N   # extract at most N items; the rest stay `pending`
 kb status             # last run, cursors, item counts, recent errors, programming types with counts, records per year, share of source_date dates
 kb rebuild            # extract everything again (e.g., after a big prompt change)
@@ -442,18 +445,20 @@ Exporting Drive files one at a time is slow, and nearly all of that time is spen
 
 ### M4: Synthesis and publish
 
-- [ ] `synthesize.py`: group `feedback` records by programming type, then into themes within each type; group records with no type into LLM-found themes; merge duplicate type names; rank themes with recent feedback weighted higher, and pick quotes (recent ones preferred). For each theme, add its breakdown by year and the most recent date it was mentioned
-- [ ] Likely-resolved check: for each theme tied to a programming type, compare when its feedback stops with the program's history, and label it **likely resolved** if it stopped after a change. Apply the same check to feature requests and bugs
-- [ ] Give synthesis the previous run's type and theme names so the structure stays stable between runs
-- [ ] Render the markdown doc in the structure above, with citation markers on every feedback point and the citations appendix
-- [ ] Per-session types: keep feedback with a `session` out of the type's themes and the likely-resolved check, and group it by year and session instead. Match workshop feedback with no `session` to a session by date where possible. Lift points that come up across several sessions into the general themes and guidance, citing each session
-- [ ] Programs synthesis: for each programming type, sort its `program_info` records by `applies_to`, treat `description` facts as dated snapshots (only general ones, `session: null`, for a per-session type), and compare snapshots from different periods to find changes no source states outright. Write the current description from the latest snapshot, a history timeline that merges stated and found changes (each found change cites both sides), notes on conflicting sources, a feedback summary for each period of the history, and a **Running it** section from `guidance` facts. For a per-session type, write **By year** sections with each session's content, guidance, and feedback
-- [ ] Render the Programs doc in the structure above, with citation markers and links to and from Consolidated Feedback
-- [ ] `publish.py`: create each doc on the first run, then update it in place with `files.update`, and save both doc IDs in state
-- [ ] Write the Citations sheet from `citations.jsonl`, and its Records tab from `extracted.jsonl`
-- [ ] Citation links: render every `[C-0042]` marker in both docs, and each entry in the citations appendices, as a markdown link to the citation's saved `link` (the Discord message link or the Drive file's `webViewLink`), so the upload in `files.update` turns them into clickable links. Make the Citations sheet's link column clickable too. A `removed` citation shows as plain text with "(removed)" instead of a dead link. Discord links open only for server members who can see that channel, and Drive links follow each file's sharing settings; say so in the appendix
+- [x] `synthesize.py`: group `feedback` records by programming type, then into themes within each type; group records with no type into LLM-found themes; merge duplicate type names; rank themes with recent feedback weighted higher, and pick quotes (recent ones preferred). For each theme, add its breakdown by year and the most recent date it was mentioned
+- [x] Likely-resolved check: for each theme tied to a programming type, compare when its feedback stops with the program's history, and label it **likely resolved** if it stopped after a change. Apply the same check to feature requests and bugs
+- [x] Give synthesis the previous run's type and theme names so the structure stays stable between runs
+- [x] Render the markdown doc in the structure above, with citation markers on every feedback point and the citations appendix
+- [x] Per-session types: keep feedback with a `session` out of the type's themes and the likely-resolved check, and group it by year and session instead. Match workshop feedback with no `session` to a session by date where possible. Lift points that come up across several sessions into the general themes and guidance, citing each session
+- [x] Programs synthesis: for each programming type, sort its `program_info` records by `applies_to`, treat `description` facts as dated snapshots (only general ones, `session: null`, for a per-session type), and compare snapshots from different periods to find changes no source states outright. Write the current description from the latest snapshot, a history timeline that merges stated and found changes (each found change cites both sides), notes on conflicting sources, a feedback summary for each period of the history, and a **Running it** section from `guidance` facts. For a per-session type, write **By year** sections with each session's content, guidance, and feedback
+- [x] Render the Programs doc in the structure above, with citation markers and links to and from Consolidated Feedback
+- [x] `publish.py`: create each doc on the first run, then update it in place with `files.update`, and save both doc IDs in state
+- [x] Write the Citations sheet from `citations.jsonl`, and its Records tab from `extracted.jsonl`
+- [x] Citation links: render every `[C-0042]` marker in both docs, and each entry in the citations appendices, as a markdown link to the citation's saved `link` (the Discord message link or the Drive file's `webViewLink`), so the upload in `files.update` turns them into clickable links. Make the Citations sheet's link column clickable too. A `removed` citation shows as plain text with "(removed)" instead of a dead link. Discord links open only for server members who can see that channel, and Drive links follow each file's sharing settings; say so in the appendix
 
 **Done when:** both docs exist in Drive and every feedback point and program fact has working citation links; each programming type in Programs has a description and a history in date order; a test programming type whose 2023 and 2024 docs describe different setups, with no source mentioning the change, shows that change in its history with citations to both docs; a theme whose feedback stops after a program change is labeled **likely resolved**; two workshops from different years on different topics appear as separate sessions under By year, not as a change in Workshop's history, and feedback on one of them isn't labeled likely resolved; the Records tab can be filtered to one year; the Citations sheet lists every citation; and after adding one new piece of feedback and re-running, it shows up under "New since last update" with a new citation ID while existing IDs and both doc links stay the same.
+
+**Result (2026-11-05, 3,054 records):** the first full synthesis made 84 calls (82 through the Batch API) for $3.80 with Opus 5.5 and merged 21 duplicate type names (for example, six "Family …" names into Families). Both docs and the Citations sheet were published in the Knowledge Base folder, with every heading link resolved. The docs have 274 themes, 13 labeled likely resolved, and 93 changes found by comparing snapshots, each citing both sides. Re-publishing with no new records made no LLM calls. Two fixes came out of the live run: Drive times out replacing a large existing doc with markdown (408), so the doc is emptied through the Docs API first (about 20s), then uploaded (about 35s); and the upload client's socket timeout is raised from 60s to 10 minutes. Still to do by hand: post a test Discord message and re-run to check "New since last update" in the real doc (covered by tests), and the one-time Opus vs. Sonnet comparison under [Choosing models](#choosing-models).
 
 ### M5: Hardening and handoff
 

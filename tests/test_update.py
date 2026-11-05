@@ -1,11 +1,13 @@
 """End-to-end `kb update` runs against a fake Discord server, fake Drive, and in-memory
 Knowledge Base folder. Covers the M2 scenarios in docs/PLAN.md."""
 
+import dataclasses
 import json
 import re
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from synth_fakes import FakePublisher, FakeSynthLLM
 
 from kb import llm as llm_mod
 from kb import state as st
@@ -156,6 +158,8 @@ class World:
         self.discord = FakeDiscord()
         self.drive = FakeDrive()
         self.llm = FakeLLM()
+        self.synth = FakeSynthLLM()
+        self.publisher = FakePublisher()
         self.kb = st.MemoryFolder()
         self.cfg = Config(
             discord_server_id=SERVER,
@@ -190,11 +194,14 @@ class World:
             drive_export=self.drive.export,
             kb_folder=self.kb,
             llm=self.llm,
+            synth_llm=self.synth,
+            publisher=self.publisher,
         )
 
     def run(self, **kw):
         self.drive.exports.clear()
         self.llm.requests.clear()
+        self.synth.requests.clear()
         result = upd.run_update(
             self.cfg, log=lambda _: None, sources=self.sources(), clock=lambda: self.now, **kw
         )
@@ -512,12 +519,14 @@ def test_progress_shows_each_stage_and_its_result(world):
     lines = []
     upd.run_update(world.cfg, log=lines.append, sources=world.sources(), clock=lambda: world.now)
     text = "\n".join(lines)
-    assert "[1/8] Taking the run lock…" in text
-    assert "[3/8] Reading Discord: messages after the saved cursors…" in text
+    assert "[1/10] Taking the run lock…" in text
+    assert "[3/10] Reading Discord: messages after the saved cursors…" in text
     assert "✓ 1 new message in 1 item" in text
     assert "(1/1) Doc a: changed" in text
-    assert "[7/8] Extracting records from 2 items…" in text
-    assert "[8/8] Saving state to Drive…" in text
+    assert "[7/10] Extracting records from 2 items…" in text
+    assert "[8/10] Synthesizing the docs from" in text
+    assert "[9/10] Publishing the docs and Citations sheet…" in text
+    assert "[10/10] Saving state to Drive…" in text
     assert "Run lock released." in text
     assert lines[-1].startswith("Finished in ")
 
@@ -1100,3 +1109,107 @@ def test_rendered_body_round_trips():
     f = {"id": "x", "name": "Plan", "mimeType": gdrive.DOC_MIME, "modifiedTime": None}
     body = "# Heading\n\nSome text.\n\n---\n\nMore."
     assert upd.rendered_body(gdrive.render_file(f, body)) == body
+
+
+# ---------------------------------------------------------------------------
+# M4: synthesis and publishing
+# ---------------------------------------------------------------------------
+
+
+def test_first_run_publishes_both_docs_and_the_citations_sheet(world):
+    pub = world.publisher
+    names = sorted(f["name"] for f in pub.files.values())
+    assert names == ["Citations", "Consolidated Feedback", "Programs"]
+    feedback = pub.by_name("Consolidated Feedback")["markdown"]
+    assert "## Night Market" in feedback and "This is the first update" in feedback
+    assert "[\\[C-0001\\]](https://discord.com/channels/" in feedback
+    programs = pub.by_name("Programs")["markdown"]
+    assert "# Night Market" in programs and "## History" in programs
+    tabs = pub.by_name("Citations")["tabs"]
+    assert len(tabs["Citations"]) == 1 + len(world.citations())
+    assert len(tabs["Records"]) == 1 + len(world.records())
+    saved = json.loads(world.kb.subfolder(st.STATE_FOLDER).read(st.SYNTHESIS))
+    assert set(saved["docs"]) == {"feedback", "programs", "citations"}
+    assert saved["last_published_at"] == "2026-11-01T09:00:00Z"
+
+
+def test_a_run_with_nothing_new_doesnt_rebuild_the_docs(world):
+    uploads = len(world.publisher.uploads)
+    r = world.run()
+    assert world.synth.requests == [] and len(world.publisher.uploads) == uploads
+    assert r.synth_skipped.startswith("nothing changed since the last publish")
+    r = world.run(steps=("synthesize",), force_synthesize=True)
+    assert world.synth.requests == []  # every section reused from the saved answers
+    assert len(world.publisher.uploads) == uploads + 2
+
+
+def test_new_feedback_shows_up_as_new_with_a_new_citation_and_the_same_links(world):
+    ids_before = json.loads(world.kb.subfolder(st.STATE_FOLDER).read(st.SYNTHESIS))["docs"]
+    cites_before = set(world.citations())
+    world.discord.channel.append(msg(30, "The stalls need more lights"))
+    r = world.run()
+    new_cites = set(world.citations()) - cites_before
+    assert len(new_cites) == 1
+    (cid,) = new_cites
+    assert int(cid.split("-")[1]) > max(int(c.split("-")[1]) for c in cites_before)
+    feedback = world.publisher.by_name("Consolidated Feedback")["markdown"]
+    new = feedback.split("# New since last update", 1)[1].split("# Executive summary", 1)[0]
+    assert "The stalls need more lights" in new and f"\\[{cid}\\]" in new
+    assert "first\n" not in new and "second" not in new
+    ids_after = json.loads(world.kb.subfolder(st.STATE_FOLDER).read(st.SYNTHESIS))["docs"]
+    assert ids_after == ids_before and len(world.publisher.files) == 3
+    # Only Night Market (and the summary) were synthesized again.
+    assert world.synth.keys() == ["type", "summary"]
+    assert r.synthesis.reused
+
+
+def test_a_publish_failure_still_saves_the_rest_of_the_run(world):
+    world.publisher.fail_sheet = True
+    world.discord.channel.append(msg(31, "Another point"))
+    r = world.run()
+    assert r.synth_error == "RuntimeError: sheet write failed"
+    assert world.state()["cursors"]["discord_channel"] == "31"  # extraction was saved
+    saved = json.loads(world.kb.subfolder(st.STATE_FOLDER).read(st.SYNTHESIS))
+    assert saved["last_published_at"] == "2026-11-01T09:00:00Z"  # not this run
+    world.publisher.fail_sheet = False
+    r = world.run()
+    assert r.published is not None and r.synth_error is None  # tried again
+
+
+def test_removed_sources_are_marked_before_the_docs_are_built(world):
+    del world.drive.files["b"]
+    world.run()
+    feedback = world.publisher.by_name("Programs")["markdown"]
+    removed = [c for c in world.citations().values() if c["status"] == "removed"]
+    assert len(removed) == 1
+    assert removed[0]["id"] not in feedback  # its only record is dropped from the doc
+
+
+def test_dry_run_estimates_synthesis(world):
+    r = world.run(dry_run=True)
+    assert r.synth_plan is None and r.synth_skipped.startswith("nothing changed")
+    # A new synthesis model changes every section's input, so all would be asked again.
+    world.cfg = dataclasses.replace(world.cfg, llm_synthesis_model="claude-sonnet-5-5")
+    r = world.run(dry_run=True)
+    assert {u.key for u in r.synth_plan.todo} == {"merge", "type:Night Market"}
+    assert r.synth_plan.input_tokens > 0 and world.synth.requests == []
+
+
+def test_synthesize_only_reads_and_extracts_nothing(world):
+    world.discord.channel.append(msg(33, "Not read"))
+    r = world.run(steps=("synthesize",), force_synthesize=True)
+    assert r.discord.items == [] and world.llm.requests == []
+    assert r.published is not None
+
+
+def test_a_synthesis_error_is_reported_and_the_stages_still_add_up(world):
+    world.discord.channel.append(msg(34, "Needs the model"))
+    world.synth = None
+    sources = world.sources()
+    sources.synth_llm = None
+    lines = []
+    r = upd.run_update(world.cfg, log=lines.append, sources=sources, clock=lambda: world.now)
+    assert r.synth_error.startswith("RuntimeError: Synthesis needs the Anthropic client")
+    assert any(line.startswith("[9/10] Publishing: skipped (synthesis failed)") for line in lines)
+    assert any(line.startswith("[10/10] Saving state to Drive") for line in lines)
+    assert world.state()["cursors"]["discord_channel"] == "34"

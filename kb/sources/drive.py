@@ -27,7 +27,7 @@ from kb.config import DEFAULT_EXPORT_WORKERS
 
 SCOPES = [
     "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/documents.readonly",
+    "https://www.googleapis.com/auth/documents",  # write: fixing heading links in the docs
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/presentations.readonly",
 ]
