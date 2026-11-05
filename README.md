@@ -4,7 +4,7 @@ Collects feedback from a Discord channel and a set of Google Drive folders and p
 
 The full design and milestones are in [docs/PLAN.md](docs/PLAN.md).
 
-> **Status:** M0 (access and skeleton). The repo skeleton and a smoke test are in place; the `kb` commands described below arrive in milestones M1–M4. The setup steps in this README (Discord bot, Google Cloud service account, folder access) can be done now.
+> **Status:** M1 (raw pulls). `kb pull` reads everything from Discord and Drive into `data/raw/`; the other `kb` commands described below arrive in milestones M2–M4. The setup steps in this README (Discord bot, Google Cloud service account, folder access) can be done now.
 
 ## Contents
 
@@ -229,6 +229,27 @@ data/
 - You can delete `data/` at any time. The next run downloads state again, and raw files are fetched as needed.
 
 ## Running the pipeline
+
+### Raw pull (M1)
+
+```bash
+kb pull                   # read the whole channel, its threads, and every in-scope Drive file
+kb pull --source discord  # only Discord (or --source drive)
+```
+
+This is local only: nothing is written to Discord or Drive. Output goes to `data/raw/`:
+
+```
+data/raw/
+├── discord/threads/<threadId>.json    one file per thread, including the message that started it
+├── discord/messages/<messageId>.json  one file per channel message outside a thread (+ replied-to context)
+├── drive/<fileId>.md                  exported text with metadata (title, link, owner, modified time)
+└── pull_summary.json                  counts, every item with its link, and any export errors
+```
+
+Bot and system messages are left out. Docs are exported as markdown, Slides as slide text plus speaker notes, and Sheets as one table per tab. Only the direct children of each source folder are read for now (subfolders arrive in M2), so list the folders that actually hold the files in `drive.source_folder_ids`. Archived **private** threads are skipped unless the bot has the Manage Threads permission.
+
+### Full pipeline
 
 _(Available from M2 onward.)_
 
