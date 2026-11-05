@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Protocol
 
+from kb import errors
 from kb import extract as ext
 from kb import llm as llm_mod
 from kb import publish as pub_mod
@@ -900,6 +901,7 @@ def run_update(
         run = {
             "run_id": lock.run_id,
             "who": lock.holder,
+            "name": st.person(),
             "started_at": started_at,
             "full": full,
             "rebuild": rebuild,
@@ -1054,12 +1056,14 @@ def run_update(
                 state.cursors["last_run_started_at"] = started_at  # Drive's cursor
             if waiting is not None:
                 apply_waiting(state, waiting, result.extracted, started_at)
-            run.update({"finished_at": st.now_iso(), "summary": summarize(result)})
-            if pull is not None:
-                run["discord_channel_cursor"] = {
-                    "before": cursors_before.get("discord_channel"),
-                    "after": state.cursors["discord_channel"],
+            run.update(
+                {
+                    "finished_at": st.now_iso(),
+                    "summary": summarize(result),
+                    "cursors": cursor_change(cursors_before, state.cursors),
+                    "changes": run_changes(result, state.manifest),
                 }
+            )
             state.run_log.append(run)
             state.save()
             save_store(store, local_state)
@@ -1183,7 +1187,7 @@ def _synthesize(
             s.detail(f"{pub_mod.PROGRAMS_NAME}: {urls['programs']}")
             s.detail(f"{pub_mod.SHEET_NAME}: {urls['citations']}")
     except Exception as e:  # reported; the rest of the run is still saved
-        result.synth_error = f"{type(e).__name__}: {e}"
+        result.synth_error = errors.describe(e, cfg) or f"{type(e).__name__}: {e}"
         if not publishing:
             stages.skip("Publishing", "synthesis failed")
 
@@ -1364,6 +1368,77 @@ def _release(lock: st.Lock, log: Log) -> None:
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
+
+
+RUN_LOG_ITEMS = 100  # items listed per run log entry; the rest are only counted
+
+
+def cursor_change(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """The cursors before and after a run, for the run log. Thread cursors are summarized
+    (how many threads there are, and which moved) since there can be hundreds."""
+    bt, at = before.get("discord_threads") or {}, after.get("discord_threads") or {}
+    moved = sorted(t for t, c in at.items() if bt.get(t) != c)
+
+    def side(c: dict[str, Any], threads: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "discord_channel": c.get("discord_channel"),
+            "discord_threads": len(threads),
+            "last_run_started_at": c.get("last_run_started_at"),
+        }
+
+    return {
+        "before": side(before, bt),
+        "after": side(after, at),
+        "threads_moved": len(moved),
+        "threads_moved_ids": moved[:RUN_LOG_ITEMS],
+    }
+
+
+def run_changes(r: RunResult, manifest: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Which items this run found new, changed, or removed, and what extraction did with
+    each, for the run log (so "what changed on Tuesday?" has an answer)."""
+    x = r.extracted or ext.ExtractResult()
+    rows: dict[str, dict[str, Any]] = {}
+
+    def add(item_id: str, title: str | None, change: str) -> None:
+        row = rows.setdefault(item_id, {"id": item_id, "title": title, "change": change})
+        if title and not row.get("title"):
+            row["title"] = title
+
+    for i in r.discord.items:
+        if i["kind"] == "message":
+            change = "new message"
+        else:
+            change = "new messages in thread" if i["context"] else "new thread"
+        add(i["id"], i.get("title"), change)
+    for e in r.discord.edited:
+        add(e["item_id"], (manifest.get(e["item_id"]) or {}).get("title"), "edited message")
+    for d in r.discord.deleted:
+        add(d["item_id"], d.get("title"), "deleted message")
+    for f in r.drive.new:
+        add(f"drive:{f['id']}", f.get("name"), "new file")
+    for f in r.drive.changed:
+        add(f"drive:{f['id']}", f.get("name"), "changed file")
+    for key in r.drive.removed:  # manifest keys (drive:<id>)
+        add(key, (manifest.get(key) or {}).get("title"), "removed file")
+    for fid, err in r.drive.errors.items():
+        add(f"drive:{fid}", (manifest.get(f"drive:{fid}") or {}).get("title"), "export error")
+        rows[f"drive:{fid}"]["error"] = err
+    for i in r.items:  # retries and items waiting from earlier runs
+        if i.id in x.ok or i.id in x.errors or i.id in x.skipped:
+            add(i.id, i.title, "extracted from an earlier pull")
+
+    for item_id, row in rows.items():
+        if item_id in x.ok:
+            row["extraction"] = f"{_plural(x.ok[item_id], 'record')}"
+        elif item_id in x.errors:
+            row["extraction"] = f"error: {x.errors[item_id]}"
+        elif item_id in x.skipped:
+            row["extraction"] = f"skipped: {x.skipped[item_id]}"
+        elif item_id in x.deferred:
+            row["extraction"] = f"waiting ({x.deferred[item_id]})"
+    listed = list(rows.values())
+    return {"items": listed[:RUN_LOG_ITEMS], "items_total": len(listed)}
 
 
 def summarize(r: RunResult) -> dict[str, Any]:
@@ -1574,6 +1649,89 @@ def report(r: RunResult, manifest: dict[str, dict[str, Any]], log: Log, limit: i
 # ---------------------------------------------------------------------------
 
 
+def _runner(run: dict[str, Any]) -> str:
+    name, who = run.get("name"), run.get("who") or "?"
+    return f"{name} ({who})" if name else who
+
+
+def _flags(run: dict[str, Any]) -> str:
+    if run.get("requeue"):
+        return "kb requeue"
+    steps = run.get("steps") or list(STEPS)
+    srcs = run.get("sources") or list(SOURCES)
+    parts = [
+        "kb rebuild" if run.get("rebuild") else "kb update",
+        "--dry-run" if run.get("dry_run") else "",
+        "--full" if run.get("full") else "",
+        *(f"--{x}" for x in steps if len(steps) < len(STEPS)),
+        f"--limit {run['limit']}" if run.get("limit") is not None else "",
+        *(f"--source {x}" for x in srcs if len(srcs) < len(SOURCES)),
+    ]
+    return " ".join(p for p in parts if p)
+
+
+def log_lines(state: st.State, n: int = 10, items: int = 10) -> list[str]:
+    """The last `n` runs, newest first: who ran what, how the cursors moved, and which
+    items changed (up to `items` per run)."""
+    if not state.run_log:
+        return ["No runs yet."]
+    out: list[str] = []
+    for run in reversed(state.run_log[-n:]):
+        out.append(f"{run.get('started_at')}  {_flags(run)}  by {_runner(run)}")
+        c = run.get("cursors")
+        if c:
+            b, a = c.get("before") or {}, c.get("after") or {}
+            if b.get("discord_channel") != a.get("discord_channel"):
+                out.append(
+                    f"  Discord channel cursor: {b.get('discord_channel') or '-'} → "
+                    f"{a.get('discord_channel') or '-'}"
+                )
+            if c.get("threads_moved"):
+                out.append(
+                    f"  Thread cursors moved: {c['threads_moved']} of "
+                    f"{a.get('discord_threads', 0)} threads"
+                )
+            if b.get("last_run_started_at") != a.get("last_run_started_at"):
+                out.append(
+                    f"  Drive cursor (last run started): {b.get('last_run_started_at') or '-'}"
+                    f" → {a.get('last_run_started_at') or '-'}"
+                )
+        elif run.get("discord_channel_cursor"):  # older entries
+            dc = run["discord_channel_cursor"]
+            out.append(f"  Discord channel cursor: {dc.get('before')} → {dc.get('after')}")
+        ch = run.get("changes")
+        if ch and ch.get("items_total"):
+            out.append(f"  Changed items ({ch['items_total']}):")
+            for row in ch["items"][:items]:
+                extra = f" → {row['extraction']}" if row.get("extraction") else ""
+                out.append(f"    - {row['change']}: {row.get('title') or row['id']}{extra}")
+            if ch["items_total"] > items:
+                out.append(f"    … and {ch['items_total'] - items} more")
+        elif run.get("requeue"):
+            n_req = (run.get("summary") or {}).get("requeued", 0)
+            out.append(f"  {_plural(n_req, 'item')} marked to extract again")
+        elif ch is not None:
+            out.append("  Nothing new")
+        summary = run.get("summary") or {}
+        if summary.get("published"):
+            out.append("  Published the docs")
+        if summary.get("synthesis_error"):
+            err = str(summary["synthesis_error"]).splitlines()[0]
+            err = err if len(err) <= 200 else err[:200] + "…"
+            out.append(f"  Synthesis/publishing failed: {err}")
+    return out
+
+
+def run_log(cfg: Config, n: int, items: int, kb_folder: st.RemoteFolder | None = None) -> list[str]:
+    if kb_folder is None:
+        services = gdrive.Services.from_key(cfg.google_credentials_path)
+        kb_folder = st.DriveFolder(services.drive, cfg.drive_kb_folder_id)
+    folder = kb_folder.subfolder(st.STATE_FOLDER, create=False)
+    local = cfg.data_dir / "state"
+    st.download(folder, local)
+    return log_lines(st.State(local).load(), n, items)
+
+
 def status_lines(state: st.State, lock: dict[str, Any] | None) -> list[str]:
     out: list[str] = []
     if state.run_log:
@@ -1592,7 +1750,7 @@ def status_lines(state: st.State, lock: dict[str, Any] | None) -> list[str]:
         ]
         flags = [f for f in flags if f]
         out.append(
-            f"Last run: {last.get('started_at')} by {last.get('who')}"
+            f"Last run: {last.get('started_at')} by {_runner(last)}"
             + (f" ({' '.join(flags)})" if flags else "")
         )
         s = last.get("summary") or {}
@@ -1731,6 +1889,7 @@ def requeue(
             {
                 "run_id": lock.run_id,
                 "who": lock.holder,
+                "name": st.person(),
                 "started_at": started_at,
                 "finished_at": st.now_iso(),
                 "requeue": True,

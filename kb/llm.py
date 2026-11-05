@@ -20,6 +20,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from kb.errors import is_billing_error
+
 Log = Callable[[str], None]
 
 # USD per million tokens: (input, output). Batch API requests cost half. Cache reads cost
@@ -235,6 +237,8 @@ class AnthropicLLM:
         ):
             raise  # every request would fail the same way
         except anthropic.APIStatusError as e:
+            if isinstance(e, anthropic.BadRequestError) and is_billing_error(e):
+                raise  # out of credit: every request would fail the same way
             return Response(r.custom_id, error=f"API error {e.status_code}: {e.message}")
         except anthropic.APIConnectionError as e:
             return Response(r.custom_id, error=f"connection error: {e}")

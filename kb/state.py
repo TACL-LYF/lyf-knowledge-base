@@ -74,6 +74,24 @@ def who() -> str:
     return f"{user}@{socket.gethostname()}"
 
 
+def person() -> str | None:
+    """Who is running this, by name: `git config user.name`, or $KB_RUN_BY if set. The
+    lock and run log already record user@machine (`who()`), which says less to a team."""
+    import os
+    import subprocess
+
+    name = os.environ.get("KB_RUN_BY", "").strip()
+    if name:
+        return name
+    try:
+        out = subprocess.run(
+            ["git", "config", "user.name"], capture_output=True, text=True, timeout=5
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() or None
+
+
 # ---------------------------------------------------------------------------
 # Remote folders
 # ---------------------------------------------------------------------------

@@ -1,10 +1,11 @@
-"""M0 smoke test: prove the real credentials can reach Discord and Drive.
+"""Setup check: prove the real credentials can reach Discord, Drive, and the Anthropic API.
 
 Checks:
   1. Discord: read one message from the main channel.
   2. Discord: read one message from a thread in the channel (active or archived).
   3. Drive: list one file in each source folder.
   4. Drive: the Knowledge Base folder is in a Shared Drive and the service account can add files.
+  5. Anthropic: the API key works and both models in config.yaml exist (no tokens used).
 
 Run from the repo root:  python scripts/smoke_test.py
 Read-only: nothing is written to Discord or Drive.
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import sys
 
+from kb import errors
 from kb.config import ConfigError, load_config
 from kb.sources import drive as gdrive
 from kb.sources.discord import DiscordClient, DiscordError, message_link
@@ -85,10 +87,18 @@ def check_discord(cfg) -> None:
         )
 
 
+def why(e: Exception, cfg) -> str:
+    return errors.describe(e, cfg) or f"{type(e).__name__}: {e}"
+
+
 def check_drive(cfg) -> None:
     key = cfg.google_credentials_path
-    print(f"       service account: {gdrive.service_account_email(key)}")
-    svc = gdrive.drive_service(key)
+    try:
+        print(f"       service account: {gdrive.service_account_email(key)}")
+        svc = gdrive.drive_service(key)
+    except Exception as e:
+        record("Drive service account key", False, why(e, cfg))
+        return
 
     for folder_id in cfg.drive_source_folder_ids:
         label = f"Drive source file ({folder_id})"
@@ -106,8 +116,8 @@ def check_drive(cfg) -> None:
                     f"{pick['name']} ({pick['mimeType'].rsplit('.', 1)[-1]}) · "
                     f"{pick.get('webViewLink')}",
                 )
-        except Exception as e:  # googleapiclient raises HttpError with useful text
-            record(label, False, f"{type(e).__name__}: {e}")
+        except Exception as e:
+            record(label, False, why(e, cfg))
 
     if cfg.drive_kb_folder_id in cfg.drive_source_folder_ids:
         record(
@@ -134,7 +144,23 @@ def check_drive(cfg) -> None:
             f"'{kb['name']}': " + ("; ".join(problems) if problems else "writable, Shared Drive"),
         )
     except Exception as e:
-        record("Drive Knowledge Base folder", False, f"{type(e).__name__}: {e}")
+        record("Drive Knowledge Base folder", False, why(e, cfg))
+
+
+def check_anthropic(cfg) -> None:
+    if not cfg.anthropic_api_key:
+        record("Anthropic API key", False, "ANTHROPIC_API_KEY is empty in .env")
+        return
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=cfg.anthropic_api_key)
+    models = dict.fromkeys([cfg.llm_extract_model, cfg.llm_synthesis_model])
+    for model in models:
+        try:
+            info = client.models.retrieve(model)
+            record(f"Anthropic model {model}", True, f"key works; {info.display_name}")
+        except Exception as e:
+            record(f"Anthropic model {model}", False, why(e, cfg))
 
 
 def main() -> int:
@@ -152,8 +178,12 @@ def main() -> int:
         print(f"[{FAIL}] config: {e}")
         return 1
 
-    check_discord(cfg)
+    try:
+        check_discord(cfg)
+    except Exception as e:  # e.g. no internet
+        record("Discord", False, why(e, cfg))
     check_drive(cfg)
+    check_anthropic(cfg)
 
     failed = [r for r in results if r[0] == FAIL]
     print(f"\n{len(results) - len(failed)}/{len(results)} checks passed.")

@@ -1,21 +1,39 @@
-"""Command-line entry point: `kb update`, `kb status`, `kb rebuild`, `kb requeue`, `kb pull`."""
+"""Command-line entry point: `kb update`, `kb status`, `kb log`, `kb rebuild`, `kb requeue`,
+`kb pull`."""
 
 from __future__ import annotations
 
-import anthropic
-import click
-from googleapiclient.errors import HttpError
+from collections.abc import Iterator
+from contextlib import contextmanager
 
-from kb import __version__
+import click
+
+from kb import __version__, errors
 from kb import pull as raw_pull
 from kb import update as upd
-from kb.config import ConfigError, load_config
+from kb.config import Config, load_config
 from kb.pull import SOURCES
-from kb.sources.discord import DiscordError
-from kb.state import LockError
 
 DISCORD_SETTINGS = ("discord_server_id", "discord_channel_id", "discord_bot_token")
 DRIVE_SETTINGS = ("drive_source_folder_ids",)
+
+
+@contextmanager
+def friendly_errors() -> Iterator[list[Config]]:
+    """Show known problems (bad key, folder not shared, no credit, lock held...) as a short
+    message saying what to do, instead of a traceback. Append the loaded config to the
+    yielded list so hints can name the service account. Anything unrecognized is
+    re-raised unchanged, so its traceback is still there to debug."""
+    holder: list[Config] = []
+    try:
+        yield holder
+    except (click.ClickException, click.Abort):
+        raise
+    except Exception as e:
+        msg = errors.describe(e, holder[0] if holder else None)
+        if msg is None:
+            raise
+        raise click.ClickException(msg) from e
 
 
 def _run(
@@ -28,8 +46,9 @@ def _run(
     read: tuple[str, ...] = upd.SOURCES,
     force_synthesize: bool = False,
 ) -> None:
-    try:
+    with friendly_errors() as loaded:
         cfg = load_config()
+        loaded.append(cfg)
         cfg.require("drive_kb_folder_id", "google_credentials_path")
         if "pull" in steps:
             cfg.require(
@@ -50,21 +69,6 @@ def _run(
             force_synthesize=force_synthesize,
             log=click.echo,
         )
-    except (ConfigError, DiscordError, LockError) as e:
-        raise click.ClickException(str(e)) from e
-    except HttpError as e:
-        raise click.ClickException(f"Google API error: {e}") from e
-    except anthropic.AuthenticationError as e:
-        raise click.ClickException(
-            "The Anthropic API rejected the key (401). Check ANTHROPIC_API_KEY in .env."
-        ) from e
-    except anthropic.PermissionDeniedError as e:
-        raise click.ClickException(f"The Anthropic API denied the request (403): {e}") from e
-    except anthropic.NotFoundError as e:
-        raise click.ClickException(
-            f"Anthropic API: model not found ({e}). Check llm.extract_model and "
-            "llm.synthesis_model in config.yaml."
-        ) from e
     upd.report(result, upd.st.State(cfg.data_dir / "state").load().manifest, click.echo)
     if result.synth_error:
         raise click.ClickException(
@@ -175,29 +179,40 @@ def update(
 def pull(sources: tuple[str, ...], refresh_names: bool) -> None:
     """Read everything from Discord and Drive into data/raw/ (local only, full read)."""
     sources = sources or SOURCES
-    try:
+    with friendly_errors() as loaded:
         cfg = load_config()
+        loaded.append(cfg)
         if "discord" in sources:
-            cfg.require("discord_server_id", "discord_channel_id", "discord_bot_token")
+            cfg.require(*DISCORD_SETTINGS)
         if "drive" in sources:
-            cfg.require("drive_source_folder_ids", "google_credentials_path")
+            cfg.require(*DRIVE_SETTINGS, "google_credentials_path")
         raw_pull.pull(cfg, sources, log=click.echo, refresh_names=refresh_names)
-    except (ConfigError, DiscordError) as e:
-        raise click.ClickException(str(e)) from e
 
 
 @main.command()
 def status() -> None:
     """Show last run, cursors, item counts, errors, and programming types."""
-    try:
+    with friendly_errors() as loaded:
         cfg = load_config()
+        loaded.append(cfg)
         cfg.require("drive_kb_folder_id", "google_credentials_path")
         for line in upd.status(cfg):
             click.echo(line)
-    except ConfigError as e:
-        raise click.ClickException(str(e)) from e
-    except HttpError as e:
-        raise click.ClickException(f"Google API error: {e}") from e
+
+
+@main.command(name="log")
+@click.option("-n", "count", type=click.IntRange(min=1), default=10, help="How many runs.")
+@click.option(
+    "--items", type=click.IntRange(min=0), default=10, help="Changed items listed per run."
+)
+def log_cmd(count: int, items: int) -> None:
+    """Show recent runs: who ran what, how the cursors moved, and which items changed."""
+    with friendly_errors() as loaded:
+        cfg = load_config()
+        loaded.append(cfg)
+        cfg.require("drive_kb_folder_id", "google_credentials_path")
+        for line in upd.run_log(cfg, count, items):
+            click.echo(line)
 
 
 @main.command()
@@ -234,14 +249,11 @@ def requeue(force_unlock: bool) -> None:
     exporting Drive files again. Each item keeps its records until new ones replace
     them, and citation IDs stay the same.
     """
-    try:
+    with friendly_errors() as loaded:
         cfg = load_config()
+        loaded.append(cfg)
         cfg.require("drive_kb_folder_id", "google_credentials_path")
         n = upd.requeue(cfg, force_unlock=force_unlock)
-    except (ConfigError, LockError) as e:
-        raise click.ClickException(str(e)) from e
-    except HttpError as e:
-        raise click.ClickException(f"Google API error: {e}") from e
     click.echo(
         f"{n} items marked to extract again. Next: `kb update --dry-run` for the cost, "
         "then `kb update --limit 5` for a sample."
