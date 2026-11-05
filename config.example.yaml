@@ -1,0 +1,23 @@
+# Template for config.yaml. Copy it:  cp config.example.yaml config.yaml
+# config.yaml is gitignored. Secrets go in .env, not here.
+
+discord:
+  server_id: ""        # right-click the server icon → Copy Server ID
+  channel_id: ""       # right-click the feedback channel → Copy Channel ID
+
+drive:
+  source_folder_id: "" # folder with existing feedback (service account: Viewer)
+  kb_folder_id: ""     # Knowledge Base folder in a Shared Drive (service account: Content manager)
+  file_types:          # Google file types read from the source folder
+    - application/vnd.google-apps.document
+    - application/vnd.google-apps.spreadsheet
+    - application/vnd.google-apps.presentation
+
+llm:
+  model: claude-sonnet-5-5
+
+state:
+  lock_timeout_minutes: 60   # a lock older than this is treated as stale
+
+paths:
+  data_dir: data             # local cache (gitignored)

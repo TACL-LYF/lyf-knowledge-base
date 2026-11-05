@@ -1,2 +1,22 @@
-node_modules/
-*/.DS_Store
+# Secrets and local config: never commit
+.env
+config.yaml
+secrets/
+
+# Local copies of fetched data (Discord messages, Drive exports, state cache)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

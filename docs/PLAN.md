@@ -59,7 +59,8 @@ An **item** is the unit sent to the LLM for extraction:
 | Each thread: ID of the last message read in it | List active and archived threads. Skip any thread whose latest message ID isn't newer than its cursor. For the rest, fetch only messages after the cursor. A thread with no cursor is new and is read in full. |
 
 - **New messages in an old thread:** only the new messages are extracted. The earlier messages are given to the LLM as read-only context so the new ones make sense.
-- **What cursors miss:** messages edited or deleted after they were read, because neither creates a newer message ID. `kb update --full` reads the whole channel again, compares it to what's saved, extracts edited messages again, and marks deleted ones `removed`. Run it occasionally, for example before sharing the doc widely.
+- **First run:** there are no cursors yet, so the first `kb update` reads the whole channel and every thread. No flag is needed.
+- **What cursors miss:** messages edited or deleted after they were read, because neither creates a newer message ID. `kb update --full` reads the whole channel again, compares it to what's saved, extracts edited messages again, and marks deleted ones `removed`. Use it rarely, only when a full reload is actually needed (for example, after someone reports that important messages were edited or removed). Normal runs accept that later edits and deletions won't show up.
 
 ### Drive: compare the file list to the manifest
 
@@ -126,7 +127,11 @@ Knowledge Base/
     └── lock                       # prevents two runs at once
 ```
 
-At the start of a run, the script takes the lock and downloads `_state/`. At the end, it uploads `_state/` and releases the lock. If a lock is older than a set timeout, it's treated as stale and can be cleared with `--force-unlock`.
+At the start of a run, the script takes the lock and downloads `_state/` into `data/state/`. At the end, it uploads `_state/` and releases the lock. If a lock is older than a set timeout, it's treated as stale and can be cleared with `--force-unlock`.
+
+### Local copies
+
+Everything fetched is also saved locally in `data/` (`data/raw/discord/`, `data/raw/drive/`, `data/state/`) for inspection and debugging. `data/` is in `.gitignore` and never committed. Drive is the source of truth for state, so the local copy is only a cache and can be deleted at any time.
 
 ### Cursors
 
@@ -219,9 +224,15 @@ lyf-knowledge-base/
 │   └── publish.py       # update doc and Citations sheet, upload raw files
 ├── prompts/             # versioned extraction and synthesis prompts
 ├── tests/
-├── config.yaml          # channel ID, folder IDs, file types, model
+├── scripts/smoke_test.py  # M0: check Discord + Drive access with real credentials
+├── data/                # local copies of fetched data (gitignored)
+├── secrets/             # service account key (gitignored)
+├── config.example.yaml  # template for config.yaml (channel ID, folder IDs, file types, model)
+├── config.yaml          # local copy with real IDs (gitignored)
 ├── .env.example
-└── README.md
+├── .gitignore
+├── pyproject.toml       # dependencies; installs the `kb` command
+└── README.md            # setup: Discord bot, service account, Drive access
 ```
 
 ### CLI
@@ -229,7 +240,7 @@ lyf-knowledge-base/
 ```bash
 kb update             # read new Discord messages + new/changed Drive files → extract → rebuild doc
 kb update --dry-run   # show what's new or changed; no LLM calls, no writes
-kb update --full      # also read the whole Discord channel again to catch edited or deleted messages
+kb update --full      # rare: read the whole Discord channel again to catch edited or deleted messages
 kb status             # last run, cursors, item counts, recent errors, programming types with counts
 kb rebuild            # extract everything again (e.g., after a big prompt change)
 ```
@@ -239,10 +250,10 @@ kb rebuild            # extract everything again (e.g., after a big prompt chang
 | What | How | Who sets it up |
 |---|---|---|
 | Discord | Bot token, Message Content Intent on, permissions View Channel + Read Message History | Discord server admin (once) |
-| Google | Service account with Drive, Docs, Sheets, and Slides APIs enabled. The source folder is shared with it as **Viewer**, the Knowledge Base folder as **Editor**. | Google Cloud project owner (once) |
+| Google | Service account with Drive, Docs, Sheets, and Slides APIs enabled. The source folder is shared with it as **Viewer**, the Knowledge Base folder as **Editor**. The Knowledge Base folder should be in a **Shared Drive** (service account as Content manager), because service accounts have no Drive storage and can't create files in a normal My Drive folder. | Google Cloud project owner (once) |
 | LLM | Anthropic API key, with the model set in `config.yaml` | Project owner |
 
-Secrets go in `.env` (never committed). Each person who runs the pipeline needs their own `.env` with the shared credentials.
+Secrets go in `.env` and the key file in `secrets/` (both gitignored). Each person who runs the pipeline needs their own `.env` with the shared credentials. Step-by-step setup is in the [README](../README.md).
 
 ---
 
@@ -253,10 +264,13 @@ Each milestone ends with something you can demo, and doesn't depend on later mil
 ### M0: Access and skeleton
 - [ ] Create the Discord bot, enable Message Content Intent, and invite it to the server
 - [ ] Create the Google Cloud project, enable the Drive, Docs, Sheets, and Slides APIs, and create the service account
-- [ ] Share the source folder (Viewer) and Knowledge Base folder (Editor) with the service account
-- [ ] Create the Knowledge Base folder structure in Drive
-- [ ] Repo skeleton: `kb/` package, `config.yaml`, `.env.example`, `.gitignore`, dependency file
-- [ ] `git init` and the first commit
+- [ ] Share the source folder (Viewer) with the service account
+- [ ] Create the Knowledge Base folder in a Shared Drive and add the service account as Content manager
+- [x] README with setup instructions for the bot, service account, and Drive access
+- [x] `.gitignore` covering `.env`, `config.yaml`, `secrets/`, and `data/`
+- [x] Repo skeleton: `kb/` package, `config.example.yaml`, `.env.example`, dependency file
+- [x] `git init` and the first commit
+- [x] Smoke-test script (`scripts/smoke_test.py`)
 
 **Done when:** a smoke-test script can read one channel message and one thread message, and list one Drive file, using the real credentials.
 
@@ -265,7 +279,7 @@ Each milestone ends with something you can demo, and doesn't depend on later mil
 - [ ] Build items: one per thread, one per main-channel message (with the replied-to message as context)
 - [ ] `sources/drive.py`: recursive listing filtered to Docs, Sheets, and Slides
 - [ ] Exporters: Docs → markdown, Slides → slide text + speaker notes, Sheets → all tabs
-- [ ] Write the output to a local `out/` directory
+- [ ] Write the output to the local `data/raw/` directory (gitignored)
 
 **Done when:** one command produces local files for every thread, channel message, and in-scope Drive file; a person spot-checks 10 against the originals; and the speaker notes from at least one deck appear in its export.
 
@@ -302,7 +316,7 @@ Each milestone ends with something you can demo, and doesn't depend on later mil
 **Done when:** the doc exists in Drive and every feedback point has working citation links; the Citations sheet lists every citation; and after adding one new piece of feedback and re-running, it shows up under "New since last update" with a new citation ID while existing IDs and the doc link stay the same.
 
 ### M5: Hardening and handoff
-- [ ] README: 5-minute setup, how to run, when to use `--full`, what to do if something breaks
+- [ ] README: 5-minute setup, how to run, that `--full` is rarely needed and when to use it, what to do if something breaks
 - [ ] Clear error messages for common problems (missing permission, expired token, lock held)
 - [ ] Run log entries record who ran it, cursors before and after, and what changed
 - [ ] A teammate does setup and a run using only the README
@@ -324,12 +338,6 @@ Each milestone ends with something you can demo, and doesn't depend on later mil
 | Slides speaker notes | Included (Slides API) |
 | How feedback is organized | By programming type (found by the LLM, no config), then themes; other feedback goes into LLM-found themes |
 | Discord conversations | One per thread; main-channel messages outside threads are separate items; no time-based grouping |
-| Discord incremental reads | Message-ID cursors per channel and thread, with `--full` to catch edits and deletions |
+| Discord incremental reads | Message-ID cursors per channel and thread. The first run reads everything automatically. `--full` is used rarely, only for a full reload; otherwise later edits and deletions are not picked up. |
 | Drive incremental reads | List all files each run; extract files not seen before or modified after the last run started; skip the rest |
 | Citations | Discord: the exact message. Drive: the whole file. Permanent IDs; running list in `citations.jsonl` and the Citations sheet |
-
-## Open decisions
-
-| Decision | Options | Default until decided |
-|---|---|---|
-| How often to run `--full` | monthly / before sharing the doc / never | before sharing the doc widely |
