@@ -122,7 +122,6 @@ The pipeline works with **two kinds of Drive folder**: one or more source folder
   ┌───────────────────────┐            ┌──────────────────────────────┐
   │ Docs, Sheets, Slides  │   read     │ Consolidated Feedback (Doc)  │
   │ (one or more folders) │ ─────────► │ Citations (Sheet)            │
-  │                       │  pipeline  │ raw/   copies of source text │
   └───────────────────────┘            │ _state/ cursors, manifest... │
    service account: Viewer             └──────────────────────────────┘
                                          service account: Editor
@@ -146,7 +145,6 @@ The pipeline works with **two kinds of Drive folder**: one or more source folder
   | ----------------------- | -------------------------------------- | ------------------------------------------ |
   | `Consolidated Feedback` | The output doc                         | The whole team reads it                    |
   | `Citations`             | Running list of every citation         | Anyone checking a source                   |
-  | `raw/`                  | Exported text of every source read     | Debugging and audits                       |
   | `_state/`               | Cursors, manifest, saved records, lock | Only the pipeline. **Don't edit by hand.** |
 
 - **Access:** the service account needs **Editor** access, so it can create and update files.
@@ -226,6 +224,7 @@ data/
 
 - `data/` is in `.gitignore` and is **never committed**. It contains other people's messages and documents.
 - **Drive is the source of truth for state.** Each run downloads `_state/` from Drive into `data/state/` and uploads it again at the end. Your local copy is only a cache.
+- **Raw copies stay local.** Fetched messages and exported file text are only saved in `data/raw/`, never uploaded to Drive, so they don't use up Drive storage.
 - You can delete `data/` at any time. The next run downloads state again, and raw files are fetched as needed.
 
 ## Running the pipeline
@@ -267,6 +266,6 @@ The first `kb update` reads everything, because there's no saved state yet. Afte
 - **Drive:** files not seen before (including old files moved into a source folder), and files modified since the last run started. If a modified file's text is the same (for example, only a comment was added), it's skipped.
 - **Removed Drive files** are marked `removed` in the manifest.
 
-As of M2, a run saves the new content to `raw/` in the Knowledge Base folder (`raw/discord/YYYY-MM-DD.json`, `raw/drive/<fileId>.md`, plus local copies in `data/raw/`) and updates `_state/`. Extraction (M3) and the doc (M4) will plug into the same run.
+As of M2, a run saves the new content locally (`data/raw/discord/YYYY-MM-DD.json`, `data/raw/drive/<fileId>.md`) and updates `_state/` in Drive. Raw content is never uploaded to Drive. Extraction (M3) and the doc (M4) will plug into the same run.
 
 **If a run fails,** nothing in `_state/` changes and the next run starts from the same place. If a run is killed hard (e.g. the laptop closes), its lock stays behind; after `state.lock_timeout_minutes` (default 60) it counts as stale and `kb update --force-unlock` clears it.

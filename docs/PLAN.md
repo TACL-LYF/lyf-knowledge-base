@@ -117,8 +117,6 @@ Where citations appear:
 Knowledge Base/
 ├── Consolidated Feedback          # Google Doc, updated in place
 ├── Citations                      # Google Sheet, running list of all citations
-├── raw/discord/YYYY-MM-DD.json    # new messages read in each run
-├── raw/drive/<fileId>.md          # exported text of each source file
 └── _state/
     ├── cursors.json               # Discord cursors + last run start time
     ├── manifest.json              # one entry per source item
@@ -133,7 +131,7 @@ At the start of a run, the script takes the lock and downloads `_state/` into `d
 
 ### Local copies
 
-Everything fetched is also saved locally in `data/` (`data/raw/discord/`, `data/raw/drive/`, `data/state/`) for inspection and debugging. `data/raw/discord/members.json` caches the server nickname of every Discord author already looked up (user ID → username, nickname, display name), so each run only looks up new authors; it's local only. `data/` is in `.gitignore` and never committed. Drive is the source of truth for state, so the local copy is only a cache and can be deleted at any time.
+Everything fetched is saved locally in `data/` (`data/raw/discord/YYYY-MM-DD.json` for new messages read in each run, `data/raw/drive/<fileId>.md` for exported text, and `data/state/`) for inspection and debugging. Raw snapshots are **never uploaded to Drive**, so they don't use up Drive storage; only `_state/`, the doc, and the Citations sheet live there. `data/raw/discord/members.json` caches the server nickname of every Discord author already looked up (user ID → username, nickname, display name), so each run only looks up new authors; it's local only. `data/` is in `.gitignore` and never committed. Drive is the source of truth for state, so the local copy is only a cache and can be deleted at any time.
 
 ### Cursors
 
@@ -225,7 +223,7 @@ lyf-knowledge-base/
 │   ├── update.py        # one `kb update` run: lock, read what's new, save raw + state
 │   ├── extract.py       # item → feedback records + citations
 │   ├── synthesize.py    # records → programming types/themes → markdown
-│   └── publish.py       # update doc and Citations sheet, upload raw files
+│   └── publish.py       # update doc and Citations sheet
 ├── prompts/             # versioned extraction and synthesis prompts
 ├── tests/
 ├── scripts/smoke_test.py  # M0: check Discord + Drive access with real credentials
@@ -298,7 +296,7 @@ Each milestone ends with something you can demo, and doesn't depend on later mil
 - [x] Content hashing, so changes that don't affect the text are skipped
 - [x] Recursive Drive listing: read subfolders of each source folder too
 - [x] `kb update --full` for edited and deleted Discord messages
-- [x] Upload raw snapshots to `raw/` in Drive
+- [x] Save raw snapshots locally in `data/raw/` (not uploaded to Drive, to keep storage small)
 - [x] `kb update --dry-run` and `kb status`
 - [x] Tests: new channel message, new message in an old thread, new thread, new Drive file, old file moved into the folder, edited file, comment-only change, removed file, and a crash before state is saved
 - [x] Local cache of Discord server nicknames already looked up (`data/raw/discord/members.json`), so only new authors are looked up; `--full` and `kb pull --refresh-names` look everyone up again

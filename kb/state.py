@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import Any, Protocol
 
 STATE_FOLDER = "_state"
-RAW_FOLDER = "raw"
 LOCK_NAME = "lock"
 
 CURSORS = "cursors.json"

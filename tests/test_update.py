@@ -242,17 +242,17 @@ def test_edited_file_is_changed(world):
     assert [f["id"] for f in r.drive.changed] == ["a"]
     s = world.state()["manifest"]["drive:a"]
     assert s["content_hash"] == upd.content_hash("body a, edited")
-    raw = world.kb.subfolder("raw").subfolder("drive").read("a.md").decode()
-    assert "body a, edited" in raw
+    assert "body a, edited" in (world.cfg.data_dir / "raw" / "drive" / "a.md").read_text()
 
 
 def test_comment_only_change_is_skipped_by_hash(world):
-    before = world.kb.subfolder("raw").subfolder("drive").read("a.md")
+    raw_a = world.cfg.data_dir / "raw" / "drive" / "a.md"
+    before = raw_a.read_text()
     world.drive.add("a", "body a", world.now - timedelta(minutes=5))  # same text, newer time
     r = world.run()
     assert r.drive.changed == []
     assert [f["id"] for f in r.drive.unchanged] == ["a"]
-    assert world.kb.subfolder("raw").subfolder("drive").read("a.md") == before
+    assert raw_a.read_text() == before
     # Next run doesn't look at it again.
     r = world.run()
     assert world.drive.exports == [] and [f["id"] for f in r.drive.skipped] == ["a", "b"]
@@ -327,7 +327,7 @@ def test_dry_run_saves_nothing_and_takes_no_lock(world):
 def test_raw_discord_snapshot_is_one_file_per_day(world):
     world.discord.channel.append(msg(80))
     world.run()
-    day = json.loads(world.kb.subfolder("raw").subfolder("discord").read("2026-11-01.json"))
+    day = json.loads((world.cfg.data_dir / "raw" / "discord" / "2026-11-01.json").read_text())
     assert len(day["runs"]) == 2  # the first run and this one
     assert [i["id"] for i in day["runs"][1]["items"]] == ["discord-msg:80"]
 
@@ -385,3 +385,11 @@ def test_first_dry_run_creates_nothing_in_drive(tmp_path):
     assert item_ids(r) == ["discord-msg:10"]
     assert w.kb.folders == {} and w.kb.files == []
     assert upd.status(w.cfg, kb_folder=w.kb)[0] == "Last run: none yet"
+
+
+def test_raw_snapshots_are_never_uploaded(world):
+    world.discord.channel.append(msg(95))
+    world.drive.add("a", "edited", world.now - timedelta(minutes=5))
+    world.run()
+    assert set(world.kb.folders) == {st.STATE_FOLDER}
+    assert world.kb.files == []

@@ -8,7 +8,7 @@ One run:
 3. Drive: list every file in the source folders (recursively) and compare to the
    manifest: new / changed / skip / removed. New and changed files are exported, and a
    change that leaves the text the same (e.g. a comment) is skipped by content hash.
-4. Save raw snapshots locally (`data/raw/`) and in Drive (`raw/`).
+4. Save raw snapshots locally in `data/raw/` (never uploaded, to keep Drive storage small).
 5. Update the manifest, cursors and run log, upload `_state/`, release the lock.
 
 State is uploaded only at step 5, so a run that fails earlier changes nothing and the
@@ -297,35 +297,24 @@ def apply_drive(state: st.State, changes: DriveChanges, now: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _json_bytes(data: Any) -> bytes:
-    return (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-
-
 def save_raw(
     cfg: Config,
-    kb_folder: st.RemoteFolder,
     run: dict[str, Any],
     discord: DiscordChanges,
     drive: DriveChanges,
     files_by_id: dict[str, dict[str, Any]],
 ) -> None:
-    """Write this run's new content to data/raw/ and to raw/ in the Knowledge Base folder.
+    """Write this run's new content to data/raw/ (local only; nothing is uploaded).
 
-    Discord: one file per day, `raw/discord/YYYY-MM-DD.json`, holding every run that day.
-    Drive: `raw/drive/<fileId>.md`, the latest export of each new or changed file.
+    Discord: one file per day, `discord/YYYY-MM-DD.json`, holding every run that day.
+    Drive: `drive/<fileId>.md`, the latest export of each new or changed file.
     """
     raw_dir = cfg.data_dir / "raw"
-    remote_raw = kb_folder.subfolder(st.RAW_FOLDER)
 
     if discord.items or discord.deleted:
-        name = f"{run['started_at'][:10]}.json"
-        remote = remote_raw.subfolder("discord")
-        existing = remote.read(name)
-        local = raw_dir / "discord" / name
-        day: dict[str, Any] = {"date": name[:-5], "runs": []}
-        if existing is not None:
-            day = json.loads(existing)
-        elif local.is_file():
+        local = raw_dir / "discord" / f"{run['started_at'][:10]}.json"
+        day: dict[str, Any] = {"date": run["started_at"][:10], "runs": []}
+        if local.is_file():
             day = json.loads(local.read_text(encoding="utf-8"))
         day["runs"].append(
             {
@@ -337,20 +326,17 @@ def save_raw(
                 "deleted": discord.deleted,
             }
         )
-        data = _json_bytes(day)
         local.parent.mkdir(parents=True, exist_ok=True)
-        local.write_bytes(data)
-        remote.write(name, data)
+        text = json.dumps(day, indent=2, ensure_ascii=False) + "\n"
+        local.write_text(text, encoding="utf-8")
 
     unchanged = {f["id"] for f in drive.unchanged}
-    to_upload = [fid for fid in drive.exported if fid not in unchanged]
-    if to_upload:
-        remote = remote_raw.subfolder("drive")
+    to_write = [fid for fid in drive.exported if fid not in unchanged]
+    if to_write:
         (raw_dir / "drive").mkdir(parents=True, exist_ok=True)
-        for fid in to_upload:
+        for fid in to_write:
             text = gdrive.render_file(files_by_id[fid], drive.exported[fid])
             (raw_dir / "drive" / f"{fid}.md").write_text(text, encoding="utf-8")
-            remote.write(f"{fid}.md", text.encode("utf-8"), mime="text/markdown")
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +398,7 @@ def run_update(
         if dry_run:
             return result
 
-        save_raw(cfg, sources.kb_folder, run, discord, drive, {f["id"]: f for f in files})
+        save_raw(cfg, run, discord, drive, {f["id"]: f for f in files})
 
         # (M3: extraction goes here. M4: synthesis and publish.)
 
