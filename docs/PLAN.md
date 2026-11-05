@@ -1,10 +1,10 @@
 # Knowledge Base: Plan
 
-Build a repeatable pipeline that collects feedback from a Discord channel and a set of Google Drive folders, then publishes one **Consolidated Feedback** Google Doc. Anyone on the team should be able to run it, each run should only read what's new, and every piece of feedback should be cited back to its source.
+Build a repeatable pipeline that collects feedback from a Discord channel and a set of Google Drive folders, then publishes two Google Docs: **Consolidated Feedback**, and **Programs**, which describes each programming type and its history. Anyone on the team should be able to run it, each run should only read what's new, and every piece of feedback and every program fact should be cited back to its source.
 
 ## Goals
 
-- **One source of truth:** a single Google Doc, updated in place so its link never changes.
+- **One source of truth:** two Google Docs (Consolidated Feedback and Programs), each updated in place so its link never changes.
 - **Incremental:** each run reads only new or changed content.
 - **Anyone can run it:** state lives in Drive, not on one person's machine, and setup takes about 5 minutes.
 - **Cited:** every piece of feedback in the doc lists its citations. A running list of all citations is kept across runs.
@@ -33,13 +33,14 @@ Discord ─┐  │ Discord: read past message-ID cursors     │     new conten
          ├─►│ Drive: list files, keep new or modified   │──► LLM extraction ──► citations
 Drive ───┘  │        since the last run                 │                          │
             └───────────────────────────────────────────┘                          │
-       Google Doc + Citations sheet (updated in place) ◄── synthesis ◄──────────────┘
+  Feedback doc + Programs doc + Citations sheet ◄── synthesis ◄────────────────────┘
+                 (updated in place)
 ```
 
 The pipeline has two halves:
 
-1. **Extraction (expensive, incremental).** New content is turned into structured feedback records by the LLM. Each record points to one or more citations. Records and citations are saved in state, so content is never extracted twice.
-2. **Synthesis (cheap, full rebuild).** Every run regroups _all_ saved records by programming type and theme (see [Organizing feedback](#organizing-feedback-programming-types-then-themes)) and rewrites the doc. This avoids the duplicate and stale themes that come from appending. A **"New since last update"** section shows records first seen in this run.
+1. **Extraction (expensive, incremental).** The LLM turns new content into structured records. Each record has a `kind`: `feedback` (an opinion, complaint, request, or praise) or `program_info` (a fact describing a programming type or its history, such as what it is, when it ran, where, or how it changed). Each record points to one or more citations. Records and citations are saved in state, so content is never extracted twice.
+2. **Synthesis (cheap, full rebuild).** Every run regroups _all_ saved records by programming type and theme (see [Organizing feedback](#organizing-feedback-programming-types-then-themes)) and rewrites both docs. This avoids the duplicate and stale themes that come from appending. A **"New since last update"** section shows records first seen in this run.
 
 ### Source items
 
@@ -60,7 +61,7 @@ An **item** is the unit sent to the LLM for extraction:
 
 - **New messages in an old thread:** only the new messages are extracted. The earlier messages are given to the LLM as read-only context so the new ones make sense.
 - **First run:** there are no cursors yet, so the first `kb update` reads the whole channel and every thread. No flag is needed.
-- **What cursors miss:** messages edited or deleted after they were read, because neither creates a newer message ID. `kb update --full` reads the whole channel again, compares it to what's saved, extracts edited messages again, and marks deleted ones `removed`. Use it rarely, only when a full reload is actually needed (for example, after someone reports that important messages were edited or removed). Normal runs accept that later edits and deletions won't show up.
+- **What cursors miss:** messages edited or deleted after they were read, because neither creates a newer message ID. `kb update --full` reads the whole channel again, compares it to what's saved, extracts edited messages again, and marks deleted ones `removed`. `--full` also exports every Drive file again, whether or not it was modified, so a change to how files are exported (such as removing images) reaches every file. Content hashes stop this from causing re-extraction when the text is the same. Use it rarely, only when a full reload is actually needed (for example, after someone reports that important messages were edited or removed). Normal runs accept that later edits and deletions won't show up.
 
 ### Drive: compare the file list to the manifest
 
@@ -88,6 +89,17 @@ No config file lists the programming types. The LLM finds them, with this framin
 
 - **Extraction:** the prompt explains that feedback is mostly about community programming. For each record, the LLM names the programming type it's about, or `null` if it isn't about any type. To keep names consistent, it's given the list of programming types found so far (saved in `_state/programming_types.json`). It reuses an existing name when one fits, and creates a new one only when nothing fits. For example, "Night Market" is reused rather than adding "Evening Market."
 - **Synthesis:** records are grouped by programming type, and into themes within each type. Records with no programming type are grouped into themes the LLM finds. The previous run's type and theme names are given as a starting point so the doc's structure stays stable between runs.
+- **Program info:** `program_info` records use the same programming type names. They're never `null`, since a fact that isn't about a programming type isn't kept. Every fact is dated with the period it applies to (`applies_to`), descriptions included, because a program's setup can change from year to year.
+- **How a program's history is built:** a change shows up in one of two ways:
+  - **A source states it**, for example a 2024 recap saying "this year we split Night Market into three weekly nights." That becomes one `history` record.
+  - **Sources from different periods describe different setups**, for example a 2023 plan saying "one night, courtyard" and a 2024 plan saying "three nights, north lot," and no source mentions a change. Extraction sees one item at a time, so it can't catch this. Instead, each `description` fact is treated as a dated snapshot. Synthesis compares the snapshots for each programming type and writes the change into the history, citing the sources on both sides of it.
+
+  The current description comes from the most recent snapshot. When sources about the same period disagree, the timeline notes the disagreement and cites both sources, rather than choosing one.
+- **Dating feedback:** feedback records are dated the same way, with `applies_to` meaning the period the feedback is about, not when it was given. For example, a 2025 message saying "the 2023 Night Market ran out of food" is about 2023. The date it was given stays on the citation. Because feedback and program facts are dated the same way, synthesis can:
+  - show which years each theme's feedback comes from
+  - match feedback to the program setup it was about (for example, "sold out early" complaints in 2023, under the one-night setup, and none in 2024, under the three-night setup)
+  - label a theme **likely resolved** when its feedback stops after a program change, rather than listing it as a current problem
+  - rank themes and pick executive-summary takeaways with recent feedback weighted above old feedback, so a theme with many complaints from 2022 doesn't outrank this year's problems
 - **Cleanup:** if two names turn out to mean the same thing, synthesis can merge them and update the saved list. `kb status` shows each programming type and how many records it has, so odd ones are easy to spot.
 
 ## Citations
@@ -109,19 +121,23 @@ How the running list works:
 Where citations appear:
 
 - **In the doc:** each feedback point ends with linked markers such as `[C-0042] [C-0107]`, and each theme shows its citation count. An appendix lists every citation used in the doc.
-- **Citations sheet:** a Google Sheet in the Knowledge Base folder holds the complete running list, with one row per citation, including removed ones. It's rewritten on each run from `_state/citations.jsonl`.
+- **Citations sheet:** a Google Sheet in the Knowledge Base folder holds the complete running list, with one row per citation, including removed ones. It's rewritten on each run from `_state/citations.jsonl`. A second tab, **Records**, has one row per record (ID, kind, programming type, `applies_to`, `date_basis`, category, sentiment, the feedback or fact, and citation IDs), so feedback can be filtered by year, type, or category, which the docs can't do. It's rewritten from `_state/extracted.jsonl`.
 
 ## State (stored in Drive)
 
 ```
 Knowledge Base/
 ├── Consolidated Feedback          # Google Doc, updated in place
+├── Programs                       # Google Doc, updated in place
 ├── Citations                      # Google Sheet, running list of all citations
+├── raw/                           # copies of fetched content (see below)
+│   ├── discord/YYYY-MM-DD.json    # new messages read in each run that day
+│   └── drive/<fileId>.md          # latest export of each Drive file
 └── _state/
     ├── cursors.json               # Discord cursors + last run start time
     ├── manifest.json              # one entry per source item
     ├── citations.jsonl            # running list of all citations
-    ├── extracted.jsonl            # saved feedback records
+    ├── extracted.jsonl            # saved records (feedback and program_info)
     ├── programming_types.json     # programming types found so far
     ├── run_log.json               # history of runs
     └── lock                       # prevents two runs at once
@@ -131,7 +147,7 @@ At the start of a run, the script takes the lock and downloads `_state/` into `d
 
 ### Local copies
 
-Everything fetched is saved locally in `data/` (`data/raw/discord/YYYY-MM-DD.json` for new messages read in each run, `data/raw/drive/<fileId>.md` for exported text, and `data/state/`) for inspection and debugging. Raw snapshots are **never uploaded to Drive**, so they don't use up Drive storage; only `_state/`, the doc, and the Citations sheet live there. `data/raw/discord/members.json` caches the server nickname of every Discord author already looked up (user ID → username, nickname, display name), so each run only looks up new authors; it's local only. `data/` is in `.gitignore` and never committed. Drive is the source of truth for state, so the local copy is only a cache and can be deleted at any time.
+Everything fetched is saved locally in `data/` (`data/raw/discord/YYYY-MM-DD.json` for new messages read in each run, `data/raw/drive/<fileId>.md` for exported text, and `data/state/`) for inspection and debugging. Each `kb update` also uploads the run's new Discord messages and new or changed Drive exports to `raw/` in the Knowledge Base folder, so anyone on the team can see exactly what the model was given without pulling everything again. With embedded images removed, all Drive exports total about 2.8 MB, so storage isn't a concern. `kb pull` stays local only. `data/raw/discord/members.json` caches the server nickname of every Discord author already looked up (user ID → username, nickname, display name), so each run only looks up new authors; it's local only. `data/` is in `.gitignore` and never committed. Drive is the source of truth for state, so the local copy is only a cache and can be deleted at any time.
 
 ### Cursors
 
@@ -185,27 +201,85 @@ Everything fetched is saved locally in `data/` (`data/raw/discord/YYYY-MM-DD.jso
 {
   "record_id": "R-0187",
   "item_id": "discord-thread:1299876543210987654",
+  "kind": "feedback",
   "feedback": "Not enough food vendors; stalls sold out early",
   "programming_type": "Night Market", // or null
   "category": "feature_request", // bug | feature_request | confusion | praise | other
   "sentiment": "negative",
+  "applies_to": "2023-10", // the period the feedback is about (see below)
+  "date_basis": "inferred", // stated | inferred | source_date
   "citations": ["C-0042", "C-0045"],
   "first_seen": "2026-11-04T09:00:00Z"
 }
 ```
 
+A `program_info` record has the same IDs, `kind`, `programming_type` (required, never `null`), `citations`, and `first_seen`, but no `feedback`, `category`, or `sentiment`. A `description` fact describes the setup during the period in `applies_to`. A `history` fact describes a change or a one-time event:
+
+```json
+{
+  "record_id": "R-0188",
+  "item_id": "drive:1AbCdEfGhIjKlMnOp",
+  "kind": "program_info",
+  "fact": "Night Market moved from the courtyard to the north parking lot to fit more vendors",
+  "info_type": "history", // description | history
+  "applies_to": "2025-09", // the period the fact is true for, as precise as the source allows (YYYY, YYYY-MM, or YYYY-MM-DD)
+  "date_basis": "stated", // stated | inferred | source_date
+  "programming_type": "Night Market",
+  "citations": ["C-0311"],
+  "first_seen": "2026-11-04T09:00:00Z"
+}
+```
+
+Every record, of either kind, has `applies_to` and `date_basis`. For feedback, `applies_to` is the period the feedback is about. For a `program_info` fact, it's the period the fact is true for. `date_basis` records how `applies_to` was worked out:
+
+- `stated`: the source gives the date ("in September 2025 we moved…").
+- `inferred`: the model worked it out from clues such as a file name ("Night Market 2023 Plan") or "this year" in a message whose date is known.
+- `source_date`: there were no clues, so the citation's date was used (the message time, or the file's `modifiedTime`). A file's `modifiedTime` is unreliable, because a 2023 doc edited in 2025 looks like 2025. Synthesis gives these dates less weight and marks them as approximate in the timeline.
+
+`applies_to` is never `null`, because every record can fall back to a `source_date`. Most Discord feedback will be `source_date`, which is usually right, since people mostly react to something recent. If a record has several citations, its `source_date` is the earliest citation's date.
+
 ## Output doc structure
 
-1. Header: last updated, date range covered, number of sources and citations
+### Consolidated Feedback
+
+1. Header: links to the Programs doc and the Citations sheet, last updated, date range covered (the earliest to latest `applies_to`), number of sources and citations
 2. **New since last update**
-3. Executive summary (top takeaways across programming types and themes)
-4. **Programming types**, ordered by amount of feedback. For each type:
+3. Executive summary (top takeaways across programming types and themes, weighted toward recent feedback)
+4. **Programming types**, ordered by amount of feedback, with recent feedback weighted higher. For each type:
    - A short summary, plus what's working and what to improve
-   - Themes, each with a description, citation count, 2–3 quotes with authors, and the full list of citation markers
-5. **Other themes** (feedback not tied to a programming type), ordered by amount of feedback, in the same format
-6. Feature requests · Bugs (collected across everything, with citations)
+   - Themes, each with a description, citation count, a breakdown by year (for example, "2023: 12 · 2024: 3"), the most recent date it was mentioned, 2–3 quotes with authors (recent ones preferred), and the full list of citation markers. A theme whose feedback stopped after a program change is labeled **likely resolved**, with the change it followed, and listed after current themes
+5. **Other themes** (feedback not tied to a programming type), ordered the same way, in the same format
+6. Feature requests · Bugs (collected across everything, with citations, the most recent date each was mentioned, and **likely resolved** labels)
 7. Open questions / unclear feedback
 8. Appendix: citations used in the doc (ID, author, date, context, link)
+
+### Programs
+
+Built from `program_info` records, plus a feedback summary for each period from the same synthesis run.
+
+1. Header: last updated, number of programming types, link to Consolidated Feedback
+2. Index of programming types, alphabetical, linking to each section
+3. For each programming type:
+   - **Description:** what it is, who it's for, and how it runs now (from the most recent snapshot), with citation markers
+   - **History:** a timeline ordered by `applies_to`, with changes stated by a source and changes found by comparing snapshots, conflicting sources noted, and approximate (`source_date`) dates marked; each entry has citation markers, and a change found by comparison cites the sources on both sides
+   - **Feedback by period:** for each setup in the history, two or three sentences on the feedback about that period (for example, what people said about the one-night setup in 2023 compared with the three-night setup in 2024), and a link to that type's section in Consolidated Feedback
+4. Appendix: citations used in the doc
+
+## Choosing models
+
+Extraction and synthesis use separate models, set in `config.yaml`, because their mistakes have different costs:
+
+| | Extraction | Synthesis |
+| --- | --- | --- |
+| Volume | Every item, once | All saved records, every run |
+| Mistakes | Permanent: saved records are never extracted again | Temporary: fixed on the next run |
+| Changing the model later | Means paying to extract everything again | A config change; the next run rebuilds both docs |
+| Hard parts | Telling feedback apart from program facts, inferring `applies_to`, reusing programming type names | Grouping hundreds of records, comparing snapshots to find changes, "likely resolved" labels, merging duplicate type names |
+| Rough cost (Opus 5.5) | About $5–8 for the first full run with the Batch API, then small amounts | About $3–5 per run (about $1.5–2.5 on Sonnet 5.5) |
+
+- **Extraction: Claude Opus 5.5**, through the Batch API (half price) for the first run and any large run. Quality matters most here because mistakes are permanent. During the M3 spot check, run the same items through Sonnet 5.5 as well, and switch if it's just as accurate.
+- **Synthesis: Claude Opus 5.5 by default.** A cheaper model is a reasonable choice here, because nothing is locked in: if the docs come out worse, switch back and run again, with no extraction cost. During M4, render both docs with Opus 5.5 and Sonnet 5.5 once and keep the cheaper one if the difference doesn't matter.
+- **Not Haiku** for either step: extraction mistakes are permanent, and synthesis reasons over many records at once.
 
 ## Repository layout
 
@@ -229,7 +303,7 @@ lyf-knowledge-base/
 ├── scripts/smoke_test.py  # M0: check Discord + Drive access with real credentials
 ├── data/                # local copies of fetched data (gitignored)
 ├── secrets/             # service account key (gitignored)
-├── config.example.yaml  # template for config.yaml (channel ID, folder IDs, file types, model)
+├── config.example.yaml  # template for config.yaml (channel ID, folder IDs, file types, models)
 ├── config.yaml          # local copy with real IDs (gitignored)
 ├── .env.example
 ├── .gitignore
@@ -243,7 +317,7 @@ lyf-knowledge-base/
 kb update             # read new Discord messages + new/changed Drive files → extract → rebuild doc
 kb update --dry-run   # show what's new or changed; no LLM calls, no writes
 kb update --full      # rare: read the whole Discord channel again to catch edited or deleted messages
-kb status             # last run, cursors, item counts, recent errors, programming types with counts
+kb status             # last run, cursors, item counts, recent errors, programming types with counts, records per year, share of source_date dates
 kb rebuild            # extract everything again (e.g., after a big prompt change)
 kb pull               # M1/debugging: full read of Discord + Drive into data/raw/ (local only)
 ```
@@ -254,7 +328,7 @@ kb pull               # M1/debugging: full read of Discord + Drive into data/raw
 | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
 | Discord | Bot token, Message Content Intent on, permissions View Channel + Read Message History                                                                                                                                                                                                                                                                             | Discord server admin (once)       |
 | Google  | Service account with Drive, Docs, Sheets, and Slides APIs enabled. Each source folder is shared with it as **Viewer**, the Knowledge Base folder as **Editor**. The Knowledge Base folder should be in a **Shared Drive** (service account as Content manager), because service accounts have no Drive storage and can't create files in a normal My Drive folder. | Google Cloud project owner (once) |
-| LLM     | Anthropic API key, with the model set in `config.yaml`                                                                                                                                                                                                                                                                                                            | Project owner                     |
+| LLM     | Anthropic API key, with the models set in `config.yaml`                                                                                                                                                                                                                                                                                                            | Project owner                     |
 
 Secrets go in `.env` and the key file in `secrets/` (both gitignored). Each person who runs the pipeline needs their own `.env` with the shared credentials. Step-by-step setup is in the [README](../README.md).
 
@@ -296,7 +370,7 @@ Each milestone ends with something you can demo, and doesn't depend on later mil
 - [x] Content hashing, so changes that don't affect the text are skipped
 - [x] Recursive Drive listing: read subfolders of each source folder too
 - [x] `kb update --full` for edited and deleted Discord messages
-- [x] Save raw snapshots locally in `data/raw/` (not uploaded to Drive, to keep storage small)
+- [x] Save raw snapshots locally in `data/raw/`
 - [x] `kb update --dry-run` and `kb status`
 - [x] Tests: new channel message, new message in an old thread, new thread, new Drive file, old file moved into the folder, edited file, comment-only change, removed file, and a crash before state is saved
 - [x] Local cache of Discord server nicknames already looked up (`data/raw/discord/members.json`), so only new authors are looked up; `--full` and `kb pull --refresh-names` look everyone up again
@@ -305,25 +379,38 @@ Each milestone ends with something you can demo, and doesn't depend on later mil
 
 ### M3: Extraction and citations
 
+Before the first full run, cut the text sent to the LLM down to what matters. A check of the first 277 exported Drive files found 29.8 MB of text, but 27 MB of it was images embedded as base64 inside Docs exports (55 files). The largest file, "2026 Universal", was 7.6 MB, and 53 KB once images were removed. Without images the files total 2.8 MB (about 0.7M tokens), with a median of 5.7 KB and a largest file of 161 KB.
+
+- [ ] Docs exporter: remove embedded base64 images from Drive's markdown export (the `[imageN]: <data:...>` definitions), and replace each `![][imageN]` with `[image]` so the model knows an image was there. This happens in the exporter, before the text is saved or hashed, so replacing a picture in a Doc doesn't change its content hash or cause it to be extracted again. The images stay in the original Doc, which every citation links to
+- [ ] `kb update --full` exports every Drive file again, so the image removal reaches files already in the manifest. Run it once after the exporter change
+- [ ] Upload raw snapshots to `raw/` in the Knowledge Base folder again (new Discord messages per day, new or changed Drive exports), now that they're small
+- [ ] Separate models for the two steps in `config.yaml`: `llm.extract_model` (default `claude-opus-5-5`, run through the Batch API for large runs) and `llm.synthesis_model` (default `claude-opus-5-5`). See [Choosing models](#choosing-models)
+- [ ] Size check: estimate tokens for each item (characters ÷ 4 is close enough) and show the per-item estimate, the total, and the estimated cost in `kb update --dry-run`. Items over `llm.max_item_tokens` in `config.yaml` (default 100,000) are given status `skipped` with the reason, and listed in the run summary and `kb status`, unless their file ID is in `drive.allow_large_files`
 - [ ] `citations.py`: permanent IDs; one citation per Discord message and one per Drive file; active/removed status
-- [ ] Extraction prompt (in `prompts/`, versioned) framed around community programming, with structured output: feedback, programming type or `null`, category, sentiment, and citations (Discord message IDs, or the file)
+- [ ] Extraction prompt (in `prompts/`, versioned) framed around community programming, with structured output. Each record has a `kind`:
+  - `feedback`: feedback, programming type or `null`, category, sentiment, `applies_to` and `date_basis` (the period the feedback is about, not when it was given), and citations (Discord message IDs, or the file)
+  - `program_info`: a description or history fact, `info_type`, `applies_to` and `date_basis`, programming type (required), and citations. The prompt asks for the period each fact is true for, using what the source says or clues such as the file name and message date, and to use `source_date` only when there are no clues
 - [ ] Give the prompt the saved list of programming types, and add new types to `programming_types.json`
-- [ ] Check every record: it must have at least one citation, and each cited Discord message must exist in the item
+- [ ] Check every record: it must have at least one citation, each cited Discord message must exist in the item, `program_info` records must name a programming type, and every record must have an `applies_to` in `YYYY`, `YYYY-MM`, or `YYYY-MM-DD` form. If `date_basis` is `source_date`, `applies_to` is set from the citation's date in code, not taken from the model
 - [ ] New messages in an old thread: extract only those, with earlier messages as context
 - [ ] Retries, plus per-item `error` status so one failure doesn't stop the run
 - [ ] Token and cost summary at the end of each run
+- [ ] `kb status`: records per year, and the share with `date_basis: source_date`, so weak dating is easy to spot
 
-**Done when:** a full first run extracts records for every item; a person checks about 20 records to confirm the feedback is accurate, the programming type makes sense, and each citation link opens the right message or file; the programming types list has no obvious duplicates; and a second run makes 0 LLM calls.
+**Done when:** no exported Doc contains base64 image data; `--dry-run` shows token and cost estimates, and a file over the size limit is skipped and reported unless it's allowed in config; a full first run extracts records for every item that isn't skipped; a person checks about 20 records to confirm the feedback and program facts are accurate, the programming type makes sense, records have the right `applies_to` (including feedback about a past year), and each citation link opens the right message or file; the programming types list has no obvious duplicates; and a second run makes 0 LLM calls.
 
 ### M4: Synthesis and publish
 
-- [ ] `synthesize.py`: group records by programming type, then into themes within each type; group records with no type into LLM-found themes; merge duplicate type names; rank themes and pick quotes
+- [ ] `synthesize.py`: group `feedback` records by programming type, then into themes within each type; group records with no type into LLM-found themes; merge duplicate type names; rank themes with recent feedback weighted higher, and pick quotes (recent ones preferred). For each theme, add its breakdown by year and the most recent date it was mentioned
+- [ ] Likely-resolved check: for each theme tied to a programming type, compare when its feedback stops with the program's history, and label it **likely resolved** if it stopped after a change. Apply the same check to feature requests and bugs
 - [ ] Give synthesis the previous run's type and theme names so the structure stays stable between runs
 - [ ] Render the markdown doc in the structure above, with citation markers on every feedback point and the citations appendix
-- [ ] `publish.py`: create the doc on the first run, then update it in place with `files.update`, and save the doc ID in state
-- [ ] Write the Citations sheet from `citations.jsonl`
+- [ ] Programs synthesis: for each programming type, sort its `program_info` records by `applies_to`, treat `description` facts as dated snapshots, and compare snapshots from different periods to find changes no source states outright. Write the current description from the latest snapshot, a history timeline that merges stated and found changes (each found change cites both sides), notes on conflicting sources, and a feedback summary for each period of the history
+- [ ] Render the Programs doc in the structure above, with citation markers and links to and from Consolidated Feedback
+- [ ] `publish.py`: create each doc on the first run, then update it in place with `files.update`, and save both doc IDs in state
+- [ ] Write the Citations sheet from `citations.jsonl`, and its Records tab from `extracted.jsonl`
 
-**Done when:** the doc exists in Drive and every feedback point has working citation links; the Citations sheet lists every citation; and after adding one new piece of feedback and re-running, it shows up under "New since last update" with a new citation ID while existing IDs and the doc link stay the same.
+**Done when:** both docs exist in Drive and every feedback point and program fact has working citation links; each programming type in Programs has a description and a history in date order; a test programming type whose 2023 and 2024 docs describe different setups, with no source mentioning the change, shows that change in its history with citations to both docs; a theme whose feedback stops after a program change is labeled **likely resolved**; the Records tab can be filtered to one year; the Citations sheet lists every citation; and after adding one new piece of feedback and re-running, it shows up under "New since last update" with a new citation ID while existing IDs and both doc links stay the same.
 
 ### M5: Hardening and handoff
 
@@ -340,6 +427,8 @@ Each milestone ends with something you can demo, and doesn't depend on later mil
 
 **Scheduling.** For now runs are manual. Because state lives in Drive and Google access uses a service account, the same `kb update` can later run from GitHub Actions cron or a similar tool without redesign. That would mean moving secrets into the scheduler's secret store and adding failure notifications.
 
+**Reports for a single year.** Because every record is dated, a later command could publish a report for one year, such as a 2025 review, built from the same records with no new extraction.
+
 ## Decisions
 
 | Decision                  | Choice                                                                                                                                                                                           |
@@ -348,7 +437,12 @@ Each milestone ends with something you can demo, and doesn't depend on later mil
 | Run frequency             | Manual (`kb update` on demand)                                                                                                                                                                   |
 | Slides speaker notes      | Included (Slides API)                                                                                                                                                                            |
 | How feedback is organized | By programming type (found by the LLM, no config), then themes; other feedback goes into LLM-found themes                                                                                        |
+| Program descriptions and history | Extracted as `program_info` records alongside feedback, in the same pass; published as a separate **Programs** doc (not a tab, because the markdown upload in `files.update` can't target Docs tabs). Every fact is dated (`applies_to`, `date_basis`); synthesis finds changes by comparing dated snapshots |
+| Dating feedback | Every feedback record has `applies_to` (the period it's about, not when it was given) and `date_basis`, like program facts. Used for year breakdowns, matching feedback to program setups, **likely resolved** labels, and weighting recent feedback higher. The Citations sheet's Records tab allows filtering by year |
 | Discord conversations     | One per thread; main-channel messages outside threads are separate items; no time-based grouping                                                                                                 |
 | Discord incremental reads | Message-ID cursors per channel and thread. The first run reads everything automatically. `--full` is used rarely, only for a full reload; otherwise later edits and deletions are not picked up. |
 | Drive incremental reads   | List all files each run; extract files not seen before or modified after the last run started; skip the rest                                                                                     |
+| Models                    | `llm.extract_model` and `llm.synthesis_model`, both Claude Opus 5.5 by default; synthesis can be switched to a cheaper model at any time (see [Choosing models](#choosing-models)) |
+| Raw snapshots             | Saved locally in `data/raw/` and uploaded to `raw/` in the Knowledge Base folder by `kb update` (small once images are removed); `kb pull` stays local |
+| Large files and images    | Embedded images are removed from Docs exports. Items over `llm.max_item_tokens` (default 100,000) are skipped and reported unless allowed in config, so one huge file can't dominate the cost |
 | Citations                 | Discord: the exact message. Drive: the whole file. Permanent IDs; running list in `citations.jsonl` and the Citations sheet                                                                      |
