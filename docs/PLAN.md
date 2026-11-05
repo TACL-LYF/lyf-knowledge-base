@@ -221,6 +221,7 @@ lyf-knowledge-base/
 │   ├── sources/
 │   │   ├── discord.py   # channel + threads, read after cursors
 │   │   └── drive.py     # list files, compare to manifest, export Docs/Sheets/Slides
+│   ├── pull.py          # M1: full read of both sources into data/raw/
 │   ├── extract.py       # item → feedback records + citations
 │   ├── synthesize.py    # records → programming types/themes → markdown
 │   └── publish.py       # update doc and Citations sheet, upload raw files
@@ -245,6 +246,7 @@ kb update --dry-run   # show what's new or changed; no LLM calls, no writes
 kb update --full      # rare: read the whole Discord channel again to catch edited or deleted messages
 kb status             # last run, cursors, item counts, recent errors, programming types with counts
 kb rebuild            # extract everything again (e.g., after a big prompt change)
+kb pull               # M1/debugging: full read of Discord + Drive into data/raw/ (local only)
 ```
 
 ## Credentials and access
@@ -279,11 +281,11 @@ Each milestone ends with something you can demo, and doesn't depend on later mil
 
 ### M1: Raw pulls (local only, full read)
 
-- [ ] `sources/discord.py`: read the main channel and all threads (active and archived), remove bot messages, and keep each message's link
-- [ ] Build items: one per thread, one per main-channel message (with the replied-to message as context)
-- [ ] `sources/drive.py`: list the direct children of every source folder, filtered to Docs, Sheets, and Slides (subfolders are skipped)
-- [ ] Exporters: Docs → markdown, Slides → slide text + speaker notes, Sheets → all tabs
-- [ ] Write the output to the local `data/raw/` directory (gitignored)
+- [x] `sources/discord.py`: read the main channel and all threads (active and archived), remove bot messages, and keep each message's link
+- [x] Build items: one per thread, one per main-channel message (with the replied-to message as context)
+- [x] `sources/drive.py`: list the direct children of every source folder, filtered to Docs, Sheets, and Slides (subfolders are skipped)
+- [x] Exporters: Docs → markdown, Slides → slide text + speaker notes, Sheets → all tabs
+- [x] Write the output to the local `data/raw/` directory (gitignored)
 
 **Done when:** one command produces local files for every thread, channel message, and in-scope Drive file; a person spot-checks 10 against the originals; and the speaker notes from at least one deck appear in its export.
 
