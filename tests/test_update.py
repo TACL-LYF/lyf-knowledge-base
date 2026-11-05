@@ -1213,3 +1213,57 @@ def test_a_synthesis_error_is_reported_and_the_stages_still_add_up(world):
     assert any(line.startswith("[9/10] Publishing: skipped (synthesis failed)") for line in lines)
     assert any(line.startswith("[10/10] Saving state to Drive") for line in lines)
     assert world.state()["cursors"]["discord_channel"] == "34"
+
+
+# ---------------------------------------------------------------------------
+# Run log
+# ---------------------------------------------------------------------------
+
+
+def test_run_log_records_who_cursors_and_changes(world, monkeypatch):
+    monkeypatch.setenv("KB_RUN_BY", "Alex Teammate")
+    world.discord.channel.append(msg(30, "new one"))
+    world.discord.threads["20"]["messages"].append(msg(31, "late reply"))
+    world.drive.add("a", "body a, edited", world.now - timedelta(minutes=5))
+    world.drive.add("c", "body c", world.now - timedelta(minutes=5))
+    del world.drive.files["b"]
+    world.run()
+
+    run = world.state()["run_log"][-1]
+    assert run["name"] == "Alex Teammate"
+    assert run["who"]
+    c = run["cursors"]
+    assert c["before"]["discord_channel"] == "11" and c["after"]["discord_channel"] == "30"
+    assert c["threads_moved"] == 1 and c["threads_moved_ids"] == ["20"]
+    assert c["before"]["last_run_started_at"] == "2026-11-01T09:00:00Z"
+    assert c["after"]["last_run_started_at"] == "2026-11-01T10:00:00Z"
+    changes = {row["id"]: row for row in run["changes"]["items"]}
+    assert changes["discord-msg:30"]["change"] == "new message"
+    assert changes["discord-thread:20"]["change"] == "new messages in thread"
+    assert changes["drive:a"]["change"] == "changed file"
+    assert changes["drive:c"]["change"] == "new file"
+    assert changes["drive:b"]["change"] == "removed file"
+    assert changes["drive:c"]["extraction"].endswith(("record", "records"))
+    assert run["changes"]["items_total"] == 5
+
+
+def test_run_log_shows_nothing_new_and_kb_log_lists_runs(world, monkeypatch):
+    monkeypatch.setenv("KB_RUN_BY", "Alex Teammate")
+    world.run()
+    world.discord.channel.append(msg(30, "new one"))
+    world.run(limit=0)
+
+    lines = upd.run_log(world.cfg, 10, 10, kb_folder=world.kb)
+    text = "\n".join(lines)
+    assert lines[0].startswith("2026-11-01T11:00:00Z  kb update --limit 0  by Alex Teammate (")
+    assert "Discord channel cursor: 11 → 30" in text
+    assert "new message: #" in text and "→ waiting (--limit 0)" in text
+    assert "Nothing new" in text  # the second run
+    assert text.count("kb update") == 3
+
+
+def test_status_names_who_ran_last(world, monkeypatch):
+    monkeypatch.setenv("KB_RUN_BY", "Alex Teammate")
+    world.run()
+    text = "\n".join(upd.status(world.cfg, kb_folder=world.kb))
+    assert "by Alex Teammate (" in text

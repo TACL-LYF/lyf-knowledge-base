@@ -1,179 +1,55 @@
 # LYF Knowledge Base
 
-Collects feedback from a Discord channel and a set of Google Drive folders and publishes two Google Docs: **Consolidated Feedback**, organized by programming type and theme, and **Programs**, which describes each programming type, its history, and how to run it. Every piece of feedback and every program fact is cited back to its source.
+Collects feedback from a Discord channel and a set of Google Drive folders and publishes three things in the shared **Knowledge Base** Drive folder:
 
-The full design and milestones are in [docs/PLAN.md](docs/PLAN.md).
+- **Consolidated Feedback** (Google Doc): feedback grouped by programming type (night market, campfire, workshops, …) and then by theme, with what's new since the last update and an executive summary.
+- **Programs** (Google Doc): what each programming type is, how it changed over the years, how to run it, and what people said about each version.
+- **Citations** (Google Sheet): every source cited, and every extracted record, filterable by year, type, or category.
 
-> **Status:** M4 (synthesis and publish). `kb update` reads only what's new since the last run, turns it into cited records (feedback and program facts) with Claude, and rebuilds the Consolidated Feedback and Programs docs and the Citations sheet in the Knowledge Base folder, with state shared in Drive; `kb status` shows where things stand.
+Every piece of feedback and every program fact links back to the Discord message or Drive file it came from. Each run reads only what's new since the last run, and the docs are updated in place, so their links never change.
+
+> **Status:** M5 (hardening and handoff). The pipeline runs end to end; what's left is a teammate doing setup and a run from this README alone. The design and milestones are in [docs/PLAN.md](docs/PLAN.md).
 
 ## Contents
 
-1. [Before you start](#before-you-start)
-2. [Create the Discord bot](#1-create-the-discord-bot)
-3. [Create the Google Cloud service account](#2-create-the-google-cloud-service-account)
-4. [Google Drive access pattern](#3-google-drive-access-pattern)
-5. [Configure your machine](#4-configure-your-machine)
-6. [Local data](#local-data)
-7. [Running the pipeline](#running-the-pipeline)
-
-## Before you start
-
-The **one-time setup** (steps 1–3) is done once per project by whoever owns it. It needs:
-
-| Step                                                | Who can do it                                                                                   |
-| --------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| Create the Discord bot and add it to the server     | Someone with **Manage Server** permission on the Discord server                                 |
-| Create the Google Cloud project and service account | Anyone with a Google account. If your organization manages Google Cloud, you may need an admin. |
-| Share the Drive folders with the service account    | The owner of each folder, or someone allowed to share it                                        |
-
-**Each person who runs the pipeline** only does step 4 (configure your machine), using the credentials from steps 1–2.
+- [Quick start (about 5 minutes)](#quick-start-about-5-minutes)
+- [Running it](#running-it)
+- [Commands](#commands)
+- [When to use the rare options](#when-to-use-the-rare-options)
+- [If something goes wrong](#if-something-goes-wrong)
+- [How it works](#how-it-works)
+- [Local data](#local-data)
+- [One-time project setup](#one-time-project-setup) (Discord bot, Google service account, Drive folders)
+- [Development](#development)
 
 ---
 
-## 1. Create the Discord bot
+## Quick start (about 5 minutes)
 
-The pipeline reads the channel through a bot. It never uses a personal Discord account, since automating a user account breaks Discord's Terms of Service.
+This is for **anyone who runs the pipeline**. It assumes the one-time project setup is already done (it is for LYF). You don't need any Discord or Drive permissions of your own: the pipeline uses a bot and a service account.
 
-### 1.1 Create the application and bot
+**You need:** Python 3.11 or newer, `git`, and access to the team's password manager.
 
-1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and sign in.
-2. Click **New Application**, name it (for example, `LYF Knowledge Base`), accept the terms, and click **Create**.
-3. Open the **Bot** tab in the left sidebar.
-4. Under **Privileged Gateway Intents**, turn on **Message Content Intent** and click **Save Changes**.
-   Without this setting, the bot can see that messages exist but every message's text is empty.
-5. Optional: turn off **Public Bot** so only you can add the bot to servers.
-6. Click **Reset Token**, confirm, and copy the token. Discord only shows it once.
-   Store it in a password manager. It goes in `.env` as `DISCORD_BOT_TOKEN` (see [step 4](#4-configure-your-machine)).
+1. **Get the code:**
 
-> Treat the bot token like a password. Anyone who has it can read everything the bot can read. If it leaks, go back to the **Bot** tab and click **Reset Token**. The old token stops working right away.
+   ```bash
+   git clone https://github.com/TACL-LYF/lyf-knowledge-base.git
+   cd lyf-knowledge-base
+   python3 -m venv .venv
+   source .venv/bin/activate        # Windows: .venv\Scripts\activate
+   pip install -e '.[dev]'
+   ```
 
-### 1.2 Invite the bot to the server
-
-1. Open the **OAuth2** tab, then **URL Generator**.
-2. Under **Scopes**, check **bot**.
-3. Under **Bot Permissions**, check only:
-   - **View Channels**
-   - **Read Message History**
-4. Copy the generated URL at the bottom, open it in your browser, choose the server, and click **Authorize**.
-
-The bot only reads. It doesn't need permission to send messages, manage anything, or act as an administrator.
-
-### 1.3 Give the bot access to the channel
-
-- **Public channel:** nothing more to do.
-- **Private channel:** open the channel's settings → **Permissions** → **Add members or roles**, add the bot, and allow **View Channel** and **Read Message History**.
-- **Private threads:** a bot can only read a private thread if it's been added to that thread. Public threads in the channel are readable automatically.
-
-### 1.4 Get the server and channel IDs
-
-1. In Discord, open **User Settings → Advanced** and turn on **Developer Mode**.
-2. Right-click the server icon → **Copy Server ID**.
-3. Right-click the feedback channel → **Copy Channel ID**.
-
-These IDs aren't secret. They go in your local `config.yaml` (see [step 4](#4-configure-your-machine)).
-
----
-
-## 2. Create the Google Cloud service account
-
-A **service account** is a Google account that belongs to the pipeline rather than a person. The pipeline signs in with it, so nobody has to go through a Google login when they run it, and access doesn't break when someone leaves the team.
-
-### 2.1 Create a project and enable the APIs
-
-1. Go to the [Google Cloud Console](https://console.cloud.google.com/).
-2. Open the project picker at the top → **New Project**. Name it (for example, `lyf-knowledge-base`) and click **Create**. Make sure the new project is selected.
-3. Go to **APIs & Services → Library**. Search for each of these APIs and click **Enable**:
-   - **Google Drive API**: list, export, and upload files
-   - **Google Docs API**: read Docs, and fix the section links in the published docs
-   - **Google Sheets API**: read every tab of a Sheet, and write the Citations sheet
-   - **Google Slides API**: read slide text and speaker notes
-
-These APIs are free for this amount of use. You don't need to add billing.
-
-### 2.2 Create the service account
-
-1. Go to **IAM & Admin → Service Accounts** → **Create Service Account**.
-2. Name it `kb-pipeline` and click **Create and Continue**.
-3. **Skip** the "Grant this service account access to project" step and click **Continue**, then **Done**.
-   The service account needs no Cloud project roles. All of its access comes from Drive sharing (see [step 3](#3-google-drive-access-pattern)).
-4. Copy the service account's email address. It looks like
-   `kb-pipeline@<project-id>.iam.gserviceaccount.com`. You'll share the Drive folders with this address.
-
-### 2.3 Create a key
-
-1. Click the service account → **Keys** tab → **Add Key → Create new key** → **JSON** → **Create**.
-2. A `.json` file downloads. Move it into this repo's `secrets/` folder, which is in `.gitignore`. For example:
-   `secrets/kb-pipeline.json`
-3. Store a copy in your team's password manager, so other people who run the pipeline can get it there.
-
-> **The key file works like a password** for the service account. Anyone who has it can read the source folders and edit the Knowledge Base folder. Never commit it, email it, or paste it in Discord. If it leaks, delete that key on the **Keys** tab and create a new one.
-
-> **"Key creation is disabled"?** Some Google Workspace organizations block service account keys with the policy `iam.disableServiceAccountKeyCreation`. Ask your Google Workspace or Cloud admin for an exception for this project.
-
----
-
-## 3. Google Drive access pattern
-
-The pipeline works with **two kinds of Drive folder**: one or more source folders it reads, and one Knowledge Base folder it writes. It has different access to each.
-
-```
-  Source folders                       Knowledge Base folder
-  (existing feedback files)            (what the pipeline writes)
-  ┌───────────────────────┐            ┌──────────────────────────────┐
-  │ Docs, Sheets, Slides  │   read     │ Consolidated Feedback (Doc)  │
-  │ (one or more folders) │ ─────────► │ Programs (Doc)               │
-  └───────────────────────┘            │ Citations (Sheet)            │
-                                       │ _state/ cursors, manifest... │
-   service account: Viewer             └──────────────────────────────┘
-                                         service account: Editor
-                                         (Content manager in a Shared Drive)
-```
-
-### Source folders: read-only
-
-- **What they are:** the existing Drive folders that hold the feedback Docs, Sheets, and Slides. List as many as you need.
-- **What's read:** every Doc, Sheet, and Slides file inside each folder, including files in its subfolders.
-- **Access:** share each folder with the service account as **Viewer**. Sharing a folder also gives access to everything inside it, including files added later.
-- **What the pipeline does here:** lists files and exports their text. It **never** edits, moves, or deletes anything in these folders. Viewer access guarantees that, even if the code has a bug.
-- **How to share:** in Drive, right-click each folder → **Share** → paste the service account email → choose **Viewer** → turn off **Notify people** (the address can't receive mail) → **Share**.
-- **Copy each folder ID** from its URL, `https://drive.google.com/drive/folders/<FOLDER_ID>`. They go in `config.yaml` as a list under `drive.source_folder_ids`.
-
-### Knowledge Base folder: read and write
-
-- **What it is:** a new folder that holds everything the pipeline produces:
-
-  | Item                    | Purpose                                | Who uses it                                |
-  | ----------------------- | -------------------------------------- | ------------------------------------------ |
-  | `Consolidated Feedback` | Feedback by programming type and theme | The whole team reads it                    |
-  | `Programs`              | Each programming type and its history  | Whoever runs a program next                |
-  | `Citations`             | Every citation, and every record       | Anyone checking a source or filtering      |
-  | `_state/`               | Cursors, manifest, saved records, lock | Only the pipeline. **Don't edit by hand.** |
-
-- **Access:** the service account needs **Editor** access, so it can create and update files.
-- **Use a Shared Drive if you can.** Service accounts have no Drive storage of their own. In a normal "My Drive" folder, creating new files as the service account fails with a `storageQuotaExceeded` error. In a **Shared Drive**, files belong to the drive instead of the service account, so this works:
-  1. Create a Shared Drive (or use an existing one), and create the `Knowledge Base` folder in it.
-  2. Shared Drive → **Manage members** → add the service account email as **Content manager**.
-  3. Shared Drives need Google Workspace. If you only have personal Google accounts, flag this before M2, because the pipeline would need a different way to write files (for example, signing in as a person for writes).
-- **Copy the folder ID** from its URL. It goes in `config.yaml` as `drive.kb_folder_id`.
-- **Team access:** share the Knowledge Base folder (or only the two docs and the Citations sheet) with teammates as **Viewer** or **Commenter**. People who run the pipeline don't need any Drive access of their own, since the pipeline acts as the service account.
-
-### Rules for the two folders
-
-- **Keep them separate.** Don't put the Knowledge Base folder inside a source folder, or list it as one. If you do, the pipeline reads its own output as if it were new feedback.
-- **Keep them minimal.** The service account should only have access to these folders. Don't share anything else with it.
-- **If a source folder is in a Shared Drive,** add the service account to that Shared Drive as **Viewer**, or share only the folder with it.
-
----
-
-## 4. Configure your machine
-
-Everyone who runs the pipeline does this step.
-
-1. Get the credentials from your team's password manager:
+2. **Get three credentials** from the team's password manager:
    - the Discord bot token
-   - the service account key file (save it as `secrets/kb-pipeline.json`)
-   - an Anthropic API key
-2. Copy `.env.example` to `.env` and fill it in:
+   - the service account key file: save it as `secrets/kb-pipeline.json` (create the `secrets/` folder)
+   - the Anthropic API key
+
+3. **Fill in `.env`** (secrets):
+
+   ```bash
+   cp .env.example .env
+   ```
 
    ```bash
    DISCORD_BOT_TOKEN=...
@@ -181,7 +57,11 @@ Everyone who runs the pipeline does this step.
    ANTHROPIC_API_KEY=...
    ```
 
-3. Copy `config.example.yaml` to `config.yaml` and fill in the IDs:
+4. **Fill in `config.yaml`** (IDs, not secret). Copy the template and paste in the Discord server and channel IDs and the Drive folder IDs. They're kept in the password manager next to the credentials; if they aren't there, `config.yaml` from anyone who already runs it works as is:
+
+   ```bash
+   cp config.example.yaml config.yaml
+   ```
 
    ```yaml
    discord:
@@ -194,161 +74,364 @@ Everyone who runs the pipeline does this step.
      kb_folder_id: "..."
    ```
 
-`.env`, `config.yaml`, and `secrets/` are in `.gitignore`. Never commit them. The IDs aren't secret, but keeping `config.yaml` local lets each person point at their own channel or folders (for example, a test setup) without changing the repo. If you add a setting, add it to `config.example.yaml` too.
+   Leave the other settings at their defaults.
 
-### Install and check access
+5. **Check access:**
 
-Needs Python 3.11 or newer.
+   ```bash
+   python scripts/smoke_test.py
+   ```
+
+   It reads one Discord message and one thread message, lists one file in each source folder, checks that the Knowledge Base folder is writable, and checks the Anthropic key and models. Nothing is written anywhere, and no tokens are used. Every line should say `PASS`; a `FAIL` line says what to fix (see also [If something goes wrong](#if-something-goes-wrong)).
+
+6. **See where things stand:**
+
+   ```bash
+   kb status
+   ```
+
+   This shows the last run and who did it, item counts, any errors, and the links to the published docs.
+
+That's it. `.env`, `config.yaml`, `secrets/`, and `data/` are in `.gitignore`; never commit them.
+
+---
+
+## Running it
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e '.[dev]'
-
-python scripts/smoke_test.py   # read-only check of Discord and Drive access
-pytest                         # unit tests (no credentials needed)
+kb update --dry-run   # optional: what's new, and the estimated cost; nothing is sent or saved
+kb update             # read what's new, extract it, and update the docs
 ```
 
-The smoke test reads one message from the channel, one from a thread, lists one file in each source folder, and checks that the Knowledge Base folder is in a Shared Drive and writable by the service account. It prints `PASS`/`FAIL` for each check with a hint when something is missing.
+A normal run:
+
+1. Takes a lock in Drive, so two people can't run at once.
+2. Downloads the shared state (`_state/` in the Knowledge Base folder).
+3. Reads new Discord messages and new or changed Drive files.
+4. Sends each new item to Claude, which pulls out cited **records** (feedback and program facts).
+5. Rebuilds and republishes the two docs and the Citations sheet, but only the sections whose records changed. If nothing changed, this step is skipped and no LLM calls are made.
+6. Uploads the state and releases the lock.
+
+Each stage prints its progress and result, and the run ends with a summary: what was new, what was extracted, tokens and cost, and the doc links.
+
+**How long and how much.** A run with a handful of new items usually takes a few minutes and costs cents. Big runs (20 or more requests in one step) go through the Batch API at half price, which can take up to about an hour; leave it running. `kb update --dry-run` always shows the estimate first. For reference, extracting everything from scratch costs about $5–8 and rebuilding both docs from scratch about $4, with Claude Opus 5.5.
+
+**Anyone can run it, any time.** All state lives in Drive, so it doesn't matter who ran it last or from which computer. `kb log` shows recent runs: who ran them, how the cursors moved, and which items changed.
+
+**Ctrl-C is safe.** Requests already sent are finished, nothing more is sent, and the lock is released. Nothing in `_state/` changes unless a run completes, so the next run starts from the same place. Answers already received are cached locally, so they aren't paid for twice if you run again on the same machine.
+
+---
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `kb update` | The normal run: read what's new, extract, update the docs. |
+| `kb update --dry-run` | Show what's new and the estimated cost. No LLM calls, nothing saved, no lock. |
+| `kb status` | Last run, lock, cursors, item counts, errors, skipped files, record counts, doc links. |
+| `kb log` | Recent runs, newest first (`-n 20` for more, `--items 50` to list more items per run). |
+| `kb update --limit N` | Extract at most N items; the rest wait as `pending` for the next run. |
+| `kb update --source discord` | Read and extract only Discord (or `drive`). Combines with the flags here. |
+| `kb update --pull` | Only read Discord and Drive; new items wait as `pending`. Doesn't need the Anthropic key. |
+| `kb update --extract` | Only extract `pending` items, from the copies the last pull saved. Doesn't read Discord or Drive. |
+| `kb update --synthesize` | Only rebuild and publish the docs from saved records, even if nothing changed. |
+| `kb update --force-unlock` | Clear a lock left by an interrupted run (see [the lock](#another-run-is-in-progress)). |
+| `kb update --full` | Rare: read the whole Discord channel and export every Drive file again. |
+| `kb requeue` | Rare: mark every item to be extracted again, without doing it yet. |
+| `kb rebuild` | Rare: extract every item again now. Costs about as much as the first run; asks first. |
+| `kb pull` | Debugging: full read of Discord and Drive into `data/raw/` only. Writes nothing to Drive. |
+
+Every command has `--help`.
+
+---
+
+## When to use the rare options
+
+### `--full`: almost never
+
+A normal run reads only Discord messages **after** the last one it saw, so it never notices a message that was **edited or deleted** after it was read. Drive is different: every run lists every file and picks up edits, new files, moved files, and removed files on its own.
+
+Use `kb update --full` only when:
+
+- **Someone edited or deleted Discord messages** and you want the docs to reflect it (for example, a person asks for their feedback to be removed: delete the message, then run `--full`). Edited messages are extracted again; deleted ones have their citations marked removed and drop out of the docs.
+- **The way files are exported changed** (a code change to the Drive exporters), so every file needs exporting again. Files whose text comes out the same are still skipped, so they aren't extracted again.
+
+It re-reads the whole channel and every file, so it takes longer (a few minutes) but doesn't cost much more in LLM calls, because unchanged items aren't extracted again.
+
+### `kb rebuild` and `kb requeue`: after a big prompt change
+
+Extraction results are saved for good: once an item is extracted, it's never sent to the model again unless it changes. If the extraction prompt (`prompts/extract_v*.md`) or `llm.extract_model` changes enough that old records should be redone:
+
+- `kb rebuild` does it all in one go (costs about as much as the first run; `kb rebuild --dry-run` shows the estimate).
+- `kb requeue` only marks everything to extract again, so you can check a sample before paying for the rest:
+
+  ```bash
+  kb requeue
+  kb update --pull --source discord          # re-read Discord messages (only hashes are kept after extraction)
+  kb update --extract --dry-run --limit 10   # cost of a 10-item sample
+  kb update --extract --limit 10             # the sample
+  kb update --extract                        # the rest
+  ```
+
+Citation IDs stay the same either way, and each item keeps its old records until its new ones replace them (`prompt_version` on each record says which prompt made it).
+
+Changing the **synthesis** model or prompts doesn't need any of this: run `kb update --synthesize`, which rebuilds the docs from the saved records with no extraction cost.
+
+### A small first run
+
+On a brand-new Knowledge Base folder (no `_state/` yet), the first `kb update` reads and extracts everything. Check that it works end to end first:
+
+```bash
+kb update --dry-run --limit 5   # what would be sent, and the cost (a few cents)
+kb update --limit 5             # 5 items, done in about a minute
+kb status                       # records, types, and items still pending
+```
+
+Look over the records in `data/state/extracted.jsonl`, then run `kb update` for the rest.
+
+---
+
+## If something goes wrong
+
+The pipeline turns the common problems into a short message that says what to do. Find yours below. If a run fails partway, **nothing in `_state/` changes**, so fixing the problem and running again is always safe.
+
+| You see | What it means | What to do |
+| --- | --- | --- |
+| `Another run is in progress (held by alex@laptop since …)` | Someone (maybe you) is running it right now, or a run was killed. | If it's someone else, wait and try again; `kb status` shows who holds the lock. See [the lock](#another-run-is-in-progress). |
+| `A stale lock was found …` | A run crashed more than 60 minutes ago and left its lock. | `kb update --force-unlock`. |
+| `Missing settings: …` / `Config file not found` | `.env` or `config.yaml` is missing a value. | Fill it in ([Quick start](#quick-start-about-5-minutes) steps 3–4). |
+| `Service account key not found at …` | The key file isn't where `.env` says. | Save it as `secrets/kb-pipeline.json`, or fix `GOOGLE_APPLICATION_CREDENTIALS`. |
+| `Google rejected the service account key` | The key was deleted or disabled in Google Cloud, or your computer's clock is off. | Get the current key from the password manager. If the old one leaked or was rotated, create a new one ([step 2.3](#23-create-a-key)) and update the password manager. |
+| `Google couldn't find …` / `Google denied access to …` | A folder ID in `config.yaml` is wrong, or that folder isn't shared with the service account. | Check the ID against the folder's URL. Share the folder with the service account email shown in the message ([step 3](#3-google-drive-access-pattern)). |
+| `… can see … but can't change it` | The service account has view-only access to the Knowledge Base folder. | Make it **Content manager** of the Shared Drive. |
+| `Google Drive refused to create a file: service accounts have no storage` | The Knowledge Base folder is in someone's My Drive, not a Shared Drive. | Move it into a Shared Drive ([step 3](#knowledge-base-folder-read-and-write)). |
+| `The Google … API isn't enabled` | One of the four APIs is off in the Cloud project. | Enable it ([step 2.1](#21-create-a-project-and-enable-the-apis)), wait a minute, run again. |
+| `Discord rejected the bot token (401)` | The token in `.env` is wrong, or was reset. | Get the current token from the password manager. |
+| `Discord denied access to … (403)` | The bot can't see the channel. | Give the bot **View Channel** and **Read Message History** on it ([step 1.3](#13-give-the-bot-access-to-the-channel)). |
+| `The Anthropic API rejected the key (401)` | `ANTHROPIC_API_KEY` is wrong or revoked. | Get the current key from the password manager. |
+| `The Anthropic account is out of credit …` | Billing. | Add credit or raise the spend limit in the Anthropic Console, then run again. |
+| `… doesn't know that model` | A model name in `config.yaml` is misspelled or retired. | Fix `llm.extract_model` / `llm.synthesis_model`. |
+| `Couldn't connect to …` / `timed out` | No internet, or a flaky connection. | Check your connection and run again. |
+| `Synthesis or publishing failed: …` (at the end of a run) | Reading and extraction worked and were saved; only the docs step failed. | Fix the cause if the message names one, then `kb update --synthesize`. |
+| `kb status` lists **Errors (tried again next run)** | Individual items failed (usually a temporary API error). | Nothing: the next `kb update` retries them. If one keeps failing, check its error. |
+| `kb status` lists **Skipped (too large)** | A file is over `llm.max_item_tokens` (about 400 KB of text). | Usually fine to leave. To include it anyway, add its file ID to `drive.allow_large_files` in `config.yaml`. |
+| The run summary reports many **rate-limited retries** | Google is throttling. | Lower `drive.export_workers` in `config.yaml` (default 8). |
+
+Anything not in this table is shown with its full traceback. Run it again once (most hiccups are temporary); if it happens again, send the output to whoever maintains the pipeline.
+
+### Another run is in progress
+
+The lock is a small file in `_state/` that says who took it and when. It keeps two runs from writing the state at the same time.
+
+- **Someone else's lock:** their run may still be going, so it's never cleared early. Wait, or ask them. Once it's older than `state.lock_timeout_minutes` (default 60), it counts as stale and `kb update --force-unlock` clears it.
+- **Your own lock** (same user and machine, e.g. you closed the laptop mid-run): `kb update --force-unlock` clears it right away. Only do this if no other run of yours is going.
+
+### The docs look wrong
+
+- **A fact or quote is wrong:** follow its citation link (`[C-0042]`) to the source. If the source is right and the record is wrong, the record is in the **Records** tab of the Citations sheet. Synthesis mistakes fix themselves when the section is rebuilt; extraction mistakes stay until the item is extracted again (`kb requeue`, or edit the source so it counts as changed).
+- **Feedback someone wants removed:** delete the Discord message (or remove the Drive file from the source folder), then run `kb update --full` (Discord) or `kb update` (Drive). Its citation is marked removed and it leaves the docs.
+- **Don't edit the docs by hand.** Each run overwrites them. Comments are fine. Don't edit anything in `_state/` either.
+
+---
+
+## How it works
+
+### What counts as new
+
+- **Discord:** messages after the last one read, in the channel and in each thread (one cursor each). When an old thread gets new messages, only those are extracted, with the earlier ones as context. Bot messages are ignored. Archived **private** threads are skipped unless the bot has Manage Threads.
+- **Drive:** every Doc, Sheet, and Slides file in the source folders and their subfolders. A file is new if it wasn't seen before (including old files moved into a source folder) and changed if it was modified since the last run started and its exported text is different (a new comment alone doesn't count). Files that disappear are marked removed. Docs export as markdown with images replaced by `[image]`, Slides as slide text plus speaker notes, Sheets as one table per tab.
+
+### Extraction
+
+Each new or changed item (a Discord thread or channel message, or a Drive file) goes to `llm.extract_model` with the prompt in `prompts/extract_v2.md`. The model returns records, saved in `_state/extracted.jsonl`:
+
+- `feedback`: an opinion, complaint, request, question, or praise, with a category, sentiment, and programming type (or none).
+- `program_info`: a `description`, `history`, or `guidance` fact about a programming type.
+
+Every record says what period it's about (`applies_to`: `YYYY`, `YYYY-MM`, or `YYYY-MM-DD`, with `date_basis` saying whether the source stated it, it was inferred, or the source's own date was used), and cites the exact Discord messages or the Drive file. Citations get permanent IDs (`C-0001`, …). Workshops (and other `programming.per_session_types`) also name the specific session. Programming types and sessions found so far are given to the model so it reuses the same names.
+
+- Items over `llm.max_item_tokens` are skipped and reported, unless allowed in config (then they're split into parts but cited as one file).
+- A failed request is retried once; an item that still fails is marked `error` and retried next run, without stopping the run.
+- Edited Drive files have their records replaced (same citation ID). Removed files and deleted messages keep their records, but their citations are marked removed, so the docs leave them out.
+
+### The docs
+
+After extraction, every saved record is regrouped and both docs are rewritten in place.
+
+- **Consolidated Feedback:** new since the last update, executive summary, then each programming type (most recent feedback first) with what's working, what to improve, and themes. Each theme has a citation count, a breakdown by year, when it was last mentioned, quotes, and every citation. A theme whose feedback stopped after a program change is labeled **likely resolved**. Then themes not tied to one type, feature requests and bugs, open questions, and the citations appendix.
+- **Programs:** each type's current description, a dated history (including changes found by comparing sources from different years, citing both sides), how to run it, and what feedback said about each period. Per-session types get a **By year** section with each session.
+- **Citations sheet:** a **Citations** tab with every citation (removed ones included) and a **Records** tab with every record.
+
+Synthesis runs `llm.synthesis_model` once per programming type, once per year of sessions for per-session types, once for feedback with no type, and once for the summary. Each section's answer is saved in `_state/synthesis.json` and reused while its records don't change, whoever runs next, so a run that adds one Discord message only redoes that message's type and the summary. The model cites records by ID only; citation links, counts, year breakdowns, and quotes are filled in by code, so they always match the saved records.
+
+Citation links open the Discord message (for server members who can see the channel) or the Drive file (following its sharing settings).
+
+### Models
+
+Extraction and synthesis use separate models (`llm.extract_model` and `llm.synthesis_model`, both Claude Opus 5.5 by default). Extraction mistakes are saved permanently, so it uses the stronger model. Synthesis is rebuilt every time, so it can be switched to a cheaper model at any time: change `llm.synthesis_model` and run `kb update --synthesize`. See [Choosing models](docs/PLAN.md#choosing-models).
+
+### What's in the Knowledge Base folder
+
+| Item | Purpose |
+| --- | --- |
+| `Consolidated Feedback`, `Programs` | The docs. Share them with the team as Viewer or Commenter. |
+| `Citations` | Every citation and every record. |
+| `raw/` | The exact text the model was given, per run (Discord messages by day, Drive exports). |
+| `_state/` | Cursors, manifest, records, citations, run log, synthesis cache, lock. **Pipeline only, don't edit.** |
+
+The run log (`_state/run_log.json`, shown by `kb log`) records for each run: who ran it (git `user.name`, or `KB_RUN_BY` if set, plus user@machine), the command, the Discord and Drive cursors before and after, each item that was new, changed, or removed and what extraction did with it, and the token and cost summary.
 
 ---
 
 ## Local data
 
-The pipeline keeps local copies of everything it fetches in `data/`, so you can inspect exports and debug without fetching from Discord or Drive again:
+The pipeline keeps local copies in `data/` so you can inspect exports and debug:
 
 ```
 data/
-├── raw/discord/    # fetched messages, per run (+ members.json, cached nicknames)
-├── raw/drive/      # exported text of Drive files (embedded images replaced by [image])
-└── state/          # local copy of the _state/ folder from Drive
+├── raw/discord/   # fetched messages per day (+ members.json, cached server nicknames)
+├── raw/drive/     # exported text of each Drive file
+├── cache/         # LLM answers already received, so a crashed run doesn't pay twice
+└── state/         # local copy of _state/ from Drive
 ```
 
-- `data/` is in `.gitignore` and is **never committed**. It contains other people's messages and documents.
-- **Drive is the source of truth for state.** Each run downloads `_state/` from Drive into `data/state/` and uploads it again at the end. Your local copy is only a cache.
-- **Raw copies are also saved in Drive.** `kb update` uploads the new messages and new or changed file exports to `raw/` in the Knowledge Base folder, so teammates can see what the model was given. Embedded images are removed from Doc exports, so all of it is only a few MB. `kb pull` stays local only.
-- You can delete `data/` at any time. The next run downloads state again, and raw files are fetched as needed.
+- `data/` contains other people's messages and documents. It's gitignored; never commit or share it.
+- **Drive is the source of truth.** Each run downloads `_state/` and uploads it at the end; your local copy is only a cache. You can delete `data/` at any time.
+- Server nicknames are looked up once per author and cached. After people change nicknames, run `kb pull --refresh-names` (or `kb update --full`).
 
-## Running the pipeline
+---
 
-### Raw pull (M1)
+## One-time project setup
+
+Done once per project, by whoever owns it. **Already done for LYF**; this is here for reference and for setting up a test copy.
+
+| Step | Who can do it |
+| --- | --- |
+| Create the Discord bot and add it to the server | Someone with **Manage Server** on the Discord server |
+| Create the Google Cloud project and service account | Anyone with a Google account (a managed organization may need an admin) |
+| Share the Drive folders with the service account | The owner of each folder, or someone allowed to share it |
+
+Then put the bot token, service account key, Anthropic API key, and the IDs from these steps in the team's password manager for everyone else.
+
+### 1. Create the Discord bot
+
+The pipeline reads the channel through a bot, never a personal account (automating a user account breaks Discord's Terms of Service).
+
+#### 1.1 Create the application and bot
+
+1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and sign in.
+2. Click **New Application**, name it (for example, `LYF Knowledge Base`), accept the terms, and click **Create**.
+3. Open the **Bot** tab.
+4. Under **Privileged Gateway Intents**, turn on **Message Content Intent** and click **Save Changes**. Without it, every message's text comes back empty.
+5. Optional: turn off **Public Bot** so only you can add it to servers.
+6. Click **Reset Token**, confirm, and copy the token (Discord shows it once). Store it in the password manager; it goes in `.env` as `DISCORD_BOT_TOKEN`.
+
+> Treat the bot token like a password: anyone with it can read everything the bot can. If it leaks, click **Reset Token** again; the old one stops working right away. Then update the password manager and tell everyone who runs the pipeline.
+
+#### 1.2 Invite the bot to the server
+
+1. Open **OAuth2 → URL Generator**.
+2. Under **Scopes**, check **bot**.
+3. Under **Bot Permissions**, check only **View Channels** and **Read Message History**.
+4. Open the generated URL, choose the server, and click **Authorize**.
+
+The bot only reads. It doesn't need to send messages or manage anything.
+
+#### 1.3 Give the bot access to the channel
+
+- **Public channel:** nothing more to do.
+- **Private channel:** channel settings → **Permissions** → **Add members or roles**, add the bot, and allow **View Channel** and **Read Message History**.
+- **Private threads:** the bot can read one only if it's been added to it. Public threads are readable automatically.
+
+#### 1.4 Get the server and channel IDs
+
+1. In Discord, **User Settings → Advanced** → turn on **Developer Mode**.
+2. Right-click the server icon → **Copy Server ID**.
+3. Right-click the feedback channel → **Copy Channel ID**.
+
+These go in `config.yaml` as `discord.server_id` and `discord.channel_id`.
+
+### 2. Create the Google Cloud service account
+
+A service account is a Google account that belongs to the pipeline rather than a person, so nobody has to log in to run it and access doesn't break when someone leaves.
+
+#### 2.1 Create a project and enable the APIs
+
+1. Go to the [Google Cloud Console](https://console.cloud.google.com/).
+2. Project picker → **New Project**, name it (for example, `lyf-knowledge-base`), **Create**, and select it.
+3. **APIs & Services → Library**: search for and **Enable** each of:
+   - **Google Drive API**: list, export, and upload files
+   - **Google Docs API**: read Docs, and fix section links in the published docs
+   - **Google Sheets API**: read Sheets, and write the Citations sheet
+   - **Google Slides API**: read slide text and speaker notes
+
+These are free at this volume; no billing needed.
+
+#### 2.2 Create the service account
+
+1. **IAM & Admin → Service Accounts → Create Service Account**.
+2. Name it `kb-pipeline` and click **Create and Continue**.
+3. **Skip** "Grant this service account access to project" (it needs no project roles; all its access comes from Drive sharing), then **Done**.
+4. Copy its email, `kb-pipeline@<project-id>.iam.gserviceaccount.com`. You'll share the Drive folders with it.
+
+#### 2.3 Create a key
+
+1. Click the service account → **Keys** → **Add Key → Create new key → JSON → Create**.
+2. Save the downloaded file as `secrets/kb-pipeline.json` (gitignored), and store a copy in the password manager.
+
+> **The key works like a password** for the service account: anyone with it can read the source folders and edit the Knowledge Base folder. Never commit, email, or paste it. If it leaks, delete it on the **Keys** tab, create a new one, and update the password manager.
+
+> **"Key creation is disabled"?** Some Google Workspace organizations block keys with the policy `iam.disableServiceAccountKeyCreation`. Ask your Workspace or Cloud admin for an exception for this project.
+
+### 3. Google Drive access pattern
+
+The pipeline reads one or more **source folders** and writes one **Knowledge Base folder**, with different access to each:
+
+```
+  Source folders                       Knowledge Base folder
+  (existing feedback files)            (what the pipeline writes)
+  ┌───────────────────────┐            ┌──────────────────────────────┐
+  │ Docs, Sheets, Slides  │   read     │ Consolidated Feedback (Doc)  │
+  │ (one or more folders) │ ─────────► │ Programs (Doc)               │
+  └───────────────────────┘            │ Citations (Sheet)            │
+                                       │ raw/, _state/                │
+   service account: Viewer             └──────────────────────────────┘
+                                         service account: Content manager
+                                         (in a Shared Drive)
+```
+
+#### Source folders: read-only
+
+- Share each folder with the service account as **Viewer**: right-click → **Share** → paste the service account email → **Viewer** → turn off **Notify people** → **Share**. Sharing a folder covers everything inside it, including subfolders and files added later.
+- The pipeline only lists and exports files here. Viewer access guarantees it can't edit, move, or delete anything, even with a bug.
+- Copy each folder ID from its URL (`https://drive.google.com/drive/folders/<FOLDER_ID>`) into `drive.source_folder_ids`.
+- If a source folder is in a Shared Drive, add the service account to that Shared Drive as **Viewer**, or share just the folder.
+
+#### Knowledge Base folder: read and write
+
+- **It must be in a Shared Drive.** Service accounts have no Drive storage, so creating files in a normal My Drive folder fails with `storageQuotaExceeded`. In a Shared Drive, files belong to the drive.
+  1. Create a Shared Drive (or use an existing one) and create the `Knowledge Base` folder in it.
+  2. Shared Drive → **Manage members** → add the service account email as **Content manager**.
+  3. Shared Drives need Google Workspace (LYF has it).
+- Copy the folder ID into `drive.kb_folder_id`.
+- Share the folder, or just the two docs and the Citations sheet, with the team as **Viewer** or **Commenter**. People who run the pipeline don't need Drive access of their own.
+
+#### Rules for the folders
+
+- **Keep them separate.** Never put the Knowledge Base folder inside a source folder or list it as one, or the pipeline reads its own output as new feedback (the smoke test checks for this).
+- **Keep access minimal.** Share only these folders with the service account.
+
+---
+
+## Development
 
 ```bash
-kb pull                   # read the whole channel, its threads, and every in-scope Drive file
-kb pull --source discord  # only Discord (or --source drive)
+pip install -e '.[dev]'
+pytest              # unit tests; no credentials or network needed
+ruff check . && ruff format --check .
 ```
 
-This is local only: nothing is written to Discord or Drive. Output goes to `data/raw/`:
-
-```
-data/raw/
-├── discord/threads/<threadId>.json    one file per thread, including the message that started it
-├── discord/messages/<messageId>.json  one file per channel message outside a thread (+ replied-to context)
-├── drive/<fileId>.md                  exported text with metadata (title, link, owner, modified time)
-└── pull_summary.json                  counts, every item with its link, and any export errors
-```
-
-Bot and system messages are left out. Docs are exported as markdown, Slides as slide text plus speaker notes, and Sheets as one table per tab. Source folders are read recursively. Archived **private** threads are skipped unless the bot has the Manage Threads permission.
-
-Drive folders are listed and files exported 8 at a time (`drive.export_workers` in `config.yaml`), which brought a full Drive pull of about 280 files from about 10 minutes down to about 1. `kb update` uses the same setting. If the run summary reports many rate-limited retries, lower it; set it to 1 to go back to one at a time.
-
-Looking up each author's server nickname takes one Discord API call per person, so nicknames are remembered in `data/raw/discord/members.json` and only new authors are looked up. Use `kb pull --refresh-names` after people change their nicknames.
-
-### Full pipeline
-
-```bash
-kb update             # normal run: new Discord messages + new/changed Drive files → records → docs
-kb update --dry-run   # show what's new and the token/cost estimates; no LLM calls, nothing saved
-kb update --limit 5   # extract only 5 items (Discord and Drive alternating); the rest wait
-kb update --pull      # only read Discord and Drive; new items wait as `pending`
-kb update --extract   # only extract pending items, from what the last pull saved in raw/
-kb update --synthesize   # only rebuild and publish the docs from the saved records
-kb update --source discord   # only read and extract Discord (or `drive`); works with the flags above
-kb status             # last run, lock, cursors, item counts, errors, skipped files, records
-kb update --full      # rare: read the whole Discord channel and export every Drive file again
-kb rebuild            # rare: extract everything again (e.g. after a big prompt change)
-kb requeue            # mark everything to extract again; later `kb update` runs do it
-```
-
-The first `kb update` reads everything, because there's no saved state yet. After that, each run only reads what's new:
-
-- **Discord:** messages after the last one read in the channel and in each thread. When an old thread gets new messages, only those are new; the earlier ones are kept as context.
-- **Drive:** files not seen before (including old files moved into a source folder), and files modified since the last run started. If a modified file's text is the same (for example, only a comment was added), it's skipped.
-- **Removed Drive files** are marked `removed` in the manifest.
-
-A run saves the new content locally (`data/raw/discord/YYYY-MM-DD.json`, `data/raw/drive/<fileId>.md`), uploads the same files to `raw/` in the Knowledge Base folder, extracts records from it, rebuilds the docs if anything changed, and updates `_state/` in Drive.
-
-#### Extraction
-
-Each new or changed item (a Discord thread or channel message, or a Drive file) is sent to `llm.extract_model` with the prompt in `prompts/extract_v2.md`. The model returns **records**, saved in `_state/extracted.jsonl`:
-
-- `feedback`: an opinion, complaint, request, question, or praise, with a category, sentiment, and programming type (or none);
-- `program_info`: a `description` or `history` fact about a programming type.
-
-Every record has `applies_to` (the period it's about, `YYYY`, `YYYY-MM`, or `YYYY-MM-DD`) and `date_basis` (`stated`, `inferred`, or `source_date` when the source's own date was used), and cites the Discord messages or the Drive file it came from. Citations get permanent IDs (`C-0001`, …) in `_state/citations.jsonl`; programming types found so far are kept in `_state/programming_types.json` and given to the model so it reuses the same names.
-
-- **Run `kb update --dry-run` first.** It exports new and changed files (read-only) and shows the estimated tokens per item, the total, and the estimated cost, without calling the model. The first run after upgrading from M2 extracts everything read so far, so expect it to take a while; with 20 or more requests (`llm.batch_min_requests`) it goes through the Batch API at half price, which usually finishes within an hour.
-- **Large items are skipped.** Anything over `llm.max_item_tokens` (default 100,000, about 400 KB of text) is skipped and listed in the run summary and `kb status`. To extract a specific large file anyway, add its file ID to `drive.allow_large_files`; it's split into parts but still cited as one file.
-- **Failures don't stop the run.** A failed request is retried once; an item that still fails is marked `error` and tried again on the next run. Answers already received are cached in `data/cache/`, so a crashed run doesn't pay for them twice, and an interrupted batch is picked up again instead of being sent twice.
-- **Edited Drive files** have their records replaced (the citation ID stays the same). **Removed files and deleted messages** keep their records, but their citations are marked `removed`, so the docs leave them out.
-- Each run ends with a token and cost summary, also kept in the run log.
-
-#### Running steps separately
-
-By default `kb update` runs every step: pull (read Discord and Drive), extract, then synthesize (rebuild and publish the docs). `--pull`, `--extract`, and `--synthesize` run just those steps:
-
-- `--pull` reads and saves as usual (raw snapshots, manifest, cursors) but sends nothing to the model, so it doesn't need `ANTHROPIC_API_KEY`. New items get status `pending`. Discord items keep their messages in the manifest, because the cursors have moved past them.
-- `--extract` doesn't read Discord or Drive. It extracts pending items, items whose extraction failed, and Drive files never extracted. Drive files are read from their snapshot in `raw/drive/` in the Knowledge Base folder, so it extracts what the last pull saw. Discord items read before extraction existed have no saved messages, so they wait for a normal `kb update`.
-- `--limit N` (with or without `--extract`) extracts at most N items and leaves the rest `pending`. `--limit 0` reads but skips extraction (everything new waits as `pending`).
-- `--synthesize` doesn't read or extract anything. It rebuilds and publishes the docs from the saved records, even if nothing changed since the last publish (for example, after changing `llm.synthesis_model` or a synthesis prompt).
-- A normal `kb update` also picks up pending items. It exports pending Drive files again, so it extracts their latest text.
-
-**A small first run.** Before the full first run, check that everything works end to end with a handful of items:
-
-```bash
-kb update --dry-run --limit 5   # what would be sent, and the cost (a few cents)
-kb update --limit 5             # 5 items, sent directly (under llm.batch_min_requests), done in about a minute
-kb status                       # records, types, and the items still pending
-```
-
-Then look at the records in `_state/extracted.jsonl` (also in `data/state/`). When they look right, run `kb update` (or `kb update --extract`) for the rest.
-
-`--full` finds edited and deleted Discord messages, and exports every Drive file again even if it wasn't modified. Use it after a change to how files are exported, so the change reaches every file. Files whose text comes out the same are still skipped, so they aren't extracted again. Edited messages are extracted again.
-
-`kb rebuild` extracts every item again, keeping citation IDs. It costs about as much as the first run, so it asks first; `kb rebuild --dry-run` shows the estimate.
-
-`kb requeue` does only the first part of a rebuild: it marks every item as not extracted yet, and nothing else (no reads, no LLM calls). The following `kb update` runs then extract everything again, so you can check a sample with the new prompt before paying for the rest:
-
-```bash
-kb requeue
-kb update --pull --source discord          # re-read Discord and save its messages; Drive isn't exported
-kb update --extract --dry-run --limit 10   # cost of a 10-item sample
-kb update --extract --limit 10             # the sample: Discord from saved messages, Drive from raw/drive/
-kb update --extract                        # the rest
-```
-
-Each item keeps its old records until its new ones replace them, so for a while some records come from the old prompt (`prompt_version` on each record says which).
-
-The Discord pull is needed because only a hash of each message is kept once it's extracted, so `kb update --extract` has nothing to re-extract a Discord item from until Discord is read again. Drive files don't need it: their text is in `raw/drive/`. A plain `kb update --limit 10` works too, but it exports every Drive file again first, since they all count as not extracted.
-
-`--source discord` or `--source drive` limits any `kb update` to one source: only that source is read, and only its items are extracted. A Discord-only run doesn't move the "last run started" time that Drive's "modified since the last run" check uses, so Drive edits made in the meantime are still picked up by the next run that reads Drive.
-
-#### The docs
-
-After extraction, every saved record is regrouped and both docs are rewritten in place, so their links never change. This happens only when something they're built from changed since the last publish; a run with nothing new skips it and makes no LLM calls.
-
-- **Consolidated Feedback:** what's new since the last update, an executive summary, then each programming type (most recent feedback first) with what's working, what to improve, and themes. Each theme has its citation count, a breakdown by year, when it was last mentioned, quotes, and every citation. A theme whose feedback stopped after a program change is labeled **likely resolved**. Then themes not tied to one programming type, feature requests and bugs, open questions, and an appendix of the citations used.
-- **Programs:** for each programming type, its current description, a dated history (including changes found by comparing sources from different years, which cite both sides), how to run it, and what the feedback said in each period. Workshops (and other types in `programming.per_session_types`) get a **By year** section with each session's content, guidance, and feedback.
-- **Citations sheet:** a **Citations** tab with every citation (removed ones included) and a **Records** tab with every record, filterable by year, programming type, or category.
-
-Every citation marker such as `[C-0042]` links to its Discord message or Drive file. Discord links open only for server members who can see the channel; Drive links follow each file's sharing settings.
-
-How synthesis works and what it costs:
-
-- It runs `llm.synthesis_model` once per programming type, once per year of sessions for per-session types, once for feedback not tied to a type, and once for the executive summary. A first call also merges duplicate programming type names (for example "Family" into "Families"); merges are saved in `_state/programming_types.json` so later extractions use the kept name.
-- Each section's answer is saved in `_state/synthesis.json`, and a section whose records haven't changed is reused, whoever runs it next. A run that adds one Discord message only re-synthesizes that message's programming type and the summary. The first full synthesis of about 3,000 records costs about $3 with Claude Opus 5.5 through the Batch API; `kb update --dry-run` shows the estimate.
-- The model cites records by ID only; citation markers, counts, year breakdowns, and quotes are added by code, so they always match the saved records.
-- **If synthesis or publishing fails,** the rest of the run (new records, cursors) is still saved, the error is reported, and the command exits with an error. `kb update --synthesize` tries the docs again. A single section that fails is shown from its last good version (or its feedback is listed ungrouped) and is retried next run.
-- To try a different synthesis model, change `llm.synthesis_model` and run `kb update --synthesize`: nothing is extracted again.
-
-**If a run fails,** nothing in `_state/` changes and the next run starts from the same place. Ctrl-C stops a run cleanly: requests already sent are finished, the rest aren't sent, and the lock is released (a second Ctrl-C waits until it is). If a run is killed hard (e.g. the laptop closes), its lock stays behind. If it's your own lock (same user and machine), `kb update --force-unlock` clears it right away. Someone else's lock can only be cleared once it's stale, after `state.lock_timeout_minutes` (default 60), so a teammate's run that's still going is never interrupted.
+- Code is in `kb/` (`cli.py` is the entry point, `update.py` runs one `kb update`, `errors.py` has the friendly error messages). The repository layout and every design decision are in [docs/PLAN.md](docs/PLAN.md).
+- Prompts are in `prompts/` and versioned: change a prompt by adding a new version (`extract_v3.md`), not by editing the old one, so `prompt_version` on saved records stays meaningful.
+- New settings go in `config.example.yaml` too, with a comment, and need a default so existing `config.yaml` files keep working.
+- To try changes without touching the real docs, point a local `config.yaml` at a test Discord channel and a test Knowledge Base folder.

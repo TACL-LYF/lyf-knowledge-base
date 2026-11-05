@@ -148,7 +148,7 @@ Knowledge Base/
     ├── programming_types.json     # programming types found so far
     ├── sessions.json              # named sessions of per-session types (workshops)
     ├── synthesis.json             # doc IDs, last publish, each synthesis section's last answer
-    ├── run_log.json               # history of runs
+    ├── run_log.json               # history of runs: who, command, cursors before/after, items changed
     └── lock                       # prevents two runs at once
 ```
 
@@ -308,7 +308,8 @@ Extraction and synthesis use separate models, set in `config.yaml`, because thei
 ```
 lyf-knowledge-base/
 ├── kb/
-│   ├── cli.py           # update / rebuild / status
+│   ├── cli.py           # update / status / log / rebuild / requeue / pull
+│   ├── errors.py        # common failures → messages that say what to do
 │   ├── config.py        # loads config.yaml + .env
 │   ├── state.py         # Drive sync for _state/, lock, cursors, manifest
 │   ├── citations.py     # citation registry: ID assignment, links, status
@@ -345,6 +346,7 @@ kb update --extract   # only the extract step, for pending items (reads raw/ sna
 kb update --synthesize  # only rebuild and publish the docs from saved records, even if nothing changed
 kb update --limit N   # extract at most N items; the rest stay `pending`
 kb status             # last run, cursors, item counts, recent errors, programming types with counts, records per year, share of source_date dates
+kb log                # recent runs: who ran what, cursors before and after, items changed
 kb rebuild            # extract everything again (e.g., after a big prompt change)
 kb pull               # M1/debugging: full read of Discord + Drive into data/raw/ (local only)
 ```
@@ -462,9 +464,10 @@ Exporting Drive files one at a time is slow, and nearly all of that time is spen
 
 ### M5: Hardening and handoff
 
-- [ ] README: 5-minute setup, how to run, that `--full` is rarely needed and when to use it, what to do if something breaks
-- [ ] Clear error messages for common problems (missing permission, expired token, lock held)
-- [ ] Run log entries record who ran it, cursors before and after, and what changed
+- [x] README: 5-minute setup, how to run, that `--full` is rarely needed and when to use it, what to do if something breaks
+- [x] Clear error messages for common problems (missing permission, expired token, lock held): `kb/errors.py` turns Google (key rejected, folder not found or not shared, view-only, API not enabled, not a Shared Drive, rate limits), Discord, Anthropic (bad key, unknown model, out of credit), and network errors into a message with the fix, used by every command, the synthesis error, and the smoke test. Unknown errors keep their traceback. An out-of-credit error stops extraction instead of marking every item `error`
+- [x] Run log entries record who ran it, cursors before and after, and what changed: each entry has `name` (git `user.name`, or `KB_RUN_BY`) next to `who` (user@machine), `cursors` (channel, thread count, Drive cursor before and after, and which threads moved), and `changes` (each item new, changed, removed, or with an export error, and what extraction did with it, up to 100 per run). `kb log` shows them
+- [x] Smoke test also checks the Anthropic key and both models (no tokens used)
 - [ ] A teammate does setup and a run using only the README
 
 **Done when:** someone other than the author runs `kb update` successfully on their own machine.
