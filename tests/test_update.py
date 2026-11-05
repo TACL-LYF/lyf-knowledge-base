@@ -757,6 +757,40 @@ def test_rebuild_extracts_everything_again_and_keeps_citation_ids(world):
     assert world.run().extracted.usage.requests == 0
 
 
+def test_requeue_only_clears_then_limit_and_extract_redo_everything(world):
+    before = world.citations()
+    old_ids = {r["record_id"] for r in world.records()}
+    world.llm.requests.clear()
+
+    assert upd.requeue(world.cfg, kb_folder=world.kb, clock=lambda: world.now) == 5
+    assert world.llm.requests == []  # nothing extracted yet
+    assert world.records() and {r["record_id"] for r in world.records()} == old_ids
+    assert all("prompt_version" not in e for e in world.state()["manifest"].values())
+    lines = "\n".join(upd.status(world.cfg, kb_folder=world.kb))
+    assert "requeue" in lines and "5 items marked to extract again" in lines
+    assert "5 items not extracted yet" in lines
+    assert world.kb.subfolder(st.STATE_FOLDER).read(st.LOCK_NAME) is None  # released
+
+    world.run(limit=2)  # a sample: one Discord item and one Drive file
+    assert len(world.llm.requests) == 2
+    assert set(statuses(world).values()) == {"ok", "pending"}
+
+    world.run(steps=["extract"])  # the rest, without reading Discord or Drive
+    assert len(world.llm.requests) == 3 and world.drive.exports == []
+    assert set(statuses(world).values()) == {"ok"}
+    recs = world.records()
+    assert len(recs) == 6 and not {r["record_id"] for r in recs} & old_ids  # replaced
+    assert set(world.citations()) == set(before)
+    assert world.run().extracted.usage.requests == 0
+
+
+def test_requeue_respects_the_run_lock(world):
+    upd.st.Lock(world.kb.subfolder(st.STATE_FOLDER), clock=lambda: world.now).acquire()
+    with pytest.raises(st.LockError):
+        upd.requeue(world.cfg, kb_folder=world.kb, clock=lambda: world.now)
+    assert all("prompt_version" in e for e in world.state()["manifest"].values())
+
+
 def test_items_read_before_extraction_existed_are_caught_up(world):
     folder = world.kb.subfolder(st.STATE_FOLDER)
     manifest = json.loads(folder.read(st.MANIFEST))

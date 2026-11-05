@@ -1,4 +1,4 @@
-"""Command-line entry point: `kb update`, `kb status`, `kb rebuild`, `kb pull`."""
+"""Command-line entry point: `kb update`, `kb status`, `kb rebuild`, `kb requeue`, `kb pull`."""
 
 from __future__ import annotations
 
@@ -186,6 +186,30 @@ def rebuild(dry_run: bool, yes: bool, force_unlock: bool) -> None:
             abort=True,
         )
     _run(dry_run, full=False, rebuild=True, force_unlock=force_unlock)
+
+
+@main.command()
+@click.option("--force-unlock", is_flag=True, help="Clear a stale run lock before starting.")
+def requeue(force_unlock: bool) -> None:
+    """Mark every item to be extracted again, without extracting anything yet.
+
+    Use after a prompt change, then run `kb update` as usual: `--dry-run` for the cost,
+    `--limit N` for a sample, and `--extract` to work through the rest without
+    exporting Drive files again. Each item keeps its records until new ones replace
+    them, and citation IDs stay the same.
+    """
+    try:
+        cfg = load_config()
+        cfg.require("drive_kb_folder_id", "google_credentials_path")
+        n = upd.requeue(cfg, force_unlock=force_unlock)
+    except (ConfigError, LockError) as e:
+        raise click.ClickException(str(e)) from e
+    except HttpError as e:
+        raise click.ClickException(f"Google API error: {e}") from e
+    click.echo(
+        f"{n} items marked to extract again. Next: `kb update --dry-run` for the cost, "
+        "then `kb update --limit 5` for a sample."
+    )
 
 
 if __name__ == "__main__":

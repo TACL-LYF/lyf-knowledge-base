@@ -28,7 +28,8 @@ leaves the rest `pending`; `--limit 0` skips extraction entirely.
 A manifest entry without `prompt_version` has never been extracted (for example, items
 read before extraction existed). Such Drive files are exported and extracted again, and
 such Discord items are read again in full, so the first run after M2 catches up on its
-own. `kb rebuild` clears `prompt_version` everywhere to extract everything again.
+own. `kb rebuild` clears `prompt_version` everywhere to extract everything again;
+`kb requeue` only clears it, so the following runs (with `--limit`, `--extract`) do the work.
 """
 
 from __future__ import annotations
@@ -1247,6 +1248,7 @@ def status_lines(state: st.State, lock: dict[str, Any] | None) -> list[str]:
         flags = [
             "--full" if last.get("full") else "",
             "rebuild" if last.get("rebuild") else "",
+            "requeue" if last.get("requeue") else "",
             *(f"--{x}" for x in last.get("steps") or STEPS if len(last.get("steps") or STEPS) == 1),
             f"--limit {last['limit']}" if last.get("limit") is not None else "",
         ]
@@ -1256,7 +1258,9 @@ def status_lines(state: st.State, lock: dict[str, Any] | None) -> list[str]:
             + (f" ({' '.join(flags)})" if flags else "")
         )
         s = last.get("summary") or {}
-        if s:
+        if last.get("requeue"):
+            out.append(f"  {_plural(s.get('requeued', 0), 'item')} marked to extract again")
+        elif s:
             dsum, gsum = s.get("discord", {}), s.get("drive", {})
             out.append(
                 f"  Discord: {dsum.get('new_messages', 0)} new messages; "
@@ -1335,3 +1339,51 @@ def status(cfg: Config, kb_folder: st.RemoteFolder | None = None) -> list[str]:
     st.download(folder, local)
     lock = st.read_lock(folder) if folder is not None else None
     return status_lines(st.State(local).load(), lock)
+
+
+def requeue(
+    cfg: Config,
+    *,
+    kb_folder: st.RemoteFolder | None = None,
+    force_unlock: bool = False,
+    clock: Callable[[], datetime] | None = None,
+) -> int:
+    """Mark every extracted item as never extracted, so later runs extract it again.
+
+    Only clears `prompt_version` in the manifest: nothing is read or sent to the model,
+    and each item keeps its records and citations until its new records replace them.
+    Run `kb update` (with `--limit` and `--extract` as usual) afterwards. Returns the
+    number of items requeued.
+    """
+    if kb_folder is None:
+        services = gdrive.Services.from_key(cfg.google_credentials_path)
+        kb_folder = st.DriveFolder(services.drive, cfg.drive_kb_folder_id)
+    folder = kb_folder.subfolder(st.STATE_FOLDER, create=False)
+    if folder is None:  # nothing pulled yet, so nothing to requeue
+        return 0
+    lock = st.Lock(folder, cfg.lock_timeout_minutes, clock=clock)
+    lock.acquire(force_unlock=force_unlock)
+    try:
+        local = cfg.data_dir / "state"
+        st.download(folder, local)
+        state = st.State(local).load()
+        started_at = clock().strftime("%Y-%m-%dT%H:%M:%SZ") if clock else st.now_iso()
+        n = 0
+        for entry in state.manifest.values():
+            if entry.pop("prompt_version", None) is not None:
+                n += 1
+        state.run_log.append(
+            {
+                "run_id": lock.run_id,
+                "who": lock.holder,
+                "started_at": started_at,
+                "finished_at": st.now_iso(),
+                "requeue": True,
+                "summary": {"requeued": n},
+            }
+        )
+        state.save()
+        st.upload(folder, local)
+        return n
+    finally:
+        _release(lock, print)

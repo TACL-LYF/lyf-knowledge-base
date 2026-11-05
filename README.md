@@ -261,6 +261,7 @@ kb update --extract   # only extract pending items, from what the last pull save
 kb status             # last run, lock, cursors, item counts, errors, skipped files, records
 kb update --full      # rare: read the whole Discord channel and export every Drive file again
 kb rebuild            # rare: extract everything again (e.g. after a big prompt change)
+kb requeue            # mark everything to extract again; later `kb update` runs do it
 ```
 
 The first `kb update` reads everything, because there's no saved state yet. After that, each run only reads what's new:
@@ -308,5 +309,16 @@ Then look at the records in `_state/extracted.jsonl` (also in `data/state/`). Wh
 `--full` finds edited and deleted Discord messages, and exports every Drive file again even if it wasn't modified. Use it after a change to how files are exported, so the change reaches every file. Files whose text comes out the same are still skipped, so they aren't extracted again. Edited messages are extracted again.
 
 `kb rebuild` extracts every item again, keeping citation IDs. It costs about as much as the first run, so it asks first; `kb rebuild --dry-run` shows the estimate.
+
+`kb requeue` does only the first part of a rebuild: it marks every item as not extracted yet, and nothing else (no reads, no LLM calls). The following `kb update` runs then extract everything again, so you can check a sample with the new prompt before paying for the rest:
+
+```bash
+kb requeue
+kb update --dry-run --limit 10   # cost of a 10-item sample
+kb update --limit 10             # re-reads Discord, re-exports Drive files, extracts 10 items
+kb update --extract              # the rest, with Drive files from raw/drive/
+```
+
+Each item keeps its old records until its new ones replace them, so for a while some records come from the old prompt (`prompt_version` on each record says which). `kb update --extract` can't extract a Discord item it has no saved messages for. Those wait for the next `kb update` that reads Discord, and the run says how many there are.
 
 **If a run fails,** nothing in `_state/` changes and the next run starts from the same place. If a run is killed hard (e.g. the laptop closes), its lock stays behind; after `state.lock_timeout_minutes` (default 60) it counts as stale and `kb update --force-unlock` clears it.
