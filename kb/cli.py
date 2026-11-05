@@ -14,14 +14,8 @@ from kb.pull import SOURCES
 from kb.sources.discord import DiscordError
 from kb.state import LockError
 
-UPDATE_SETTINGS = (
-    "discord_server_id",
-    "discord_channel_id",
-    "discord_bot_token",
-    "drive_source_folder_ids",
-    "drive_kb_folder_id",
-    "google_credentials_path",
-)
+DISCORD_SETTINGS = ("discord_server_id", "discord_channel_id", "discord_bot_token")
+DRIVE_SETTINGS = ("drive_source_folder_ids",)
 
 
 def _run(
@@ -31,13 +25,16 @@ def _run(
     force_unlock: bool,
     steps: tuple[str, ...] = upd.STEPS,
     limit: int | None = None,
+    read: tuple[str, ...] = upd.SOURCES,
 ) -> None:
     try:
         cfg = load_config()
+        cfg.require("drive_kb_folder_id", "google_credentials_path")
         if "pull" in steps:
-            cfg.require(*UPDATE_SETTINGS)
-        else:
-            cfg.require("drive_kb_folder_id", "google_credentials_path")
+            cfg.require(
+                *(DISCORD_SETTINGS if "discord" in read else ()),
+                *(DRIVE_SETTINGS if "drive" in read else ()),
+            )
         if not dry_run and "extract" in steps:
             cfg.require("anthropic_api_key")
         result = upd.run_update(
@@ -47,6 +44,7 @@ def _run(
             rebuild=rebuild,
             steps=steps,
             limit=limit,
+            read=read,
             force_unlock=force_unlock,
             log=click.echo,
         )
@@ -96,6 +94,13 @@ def main() -> None:
     help="Extract at most this many items (Discord and Drive alternating); the rest wait. "
     "0 skips extraction.",
 )
+@click.option(
+    "--source",
+    "read",
+    type=click.Choice(upd.SOURCES),
+    multiple=True,
+    help="Only read and extract this source (repeatable). Default: all.",
+)
 @click.option("--force-unlock", is_flag=True, help="Clear a stale run lock before starting.")
 def update(
     dry_run: bool,
@@ -103,13 +108,16 @@ def update(
     only_pull: bool,
     only_extract: bool,
     limit: int | None,
+    read: tuple[str, ...],
     force_unlock: bool,
 ) -> None:
     """Read new content and extract feedback and program facts from it.
 
     By default every step runs. --pull and --extract run just that step (both together
     is the same as neither). Items that are read but not extracted wait as `pending` and
-    are extracted by the next run that extracts.
+    are extracted by the next run that extracts. --source limits the run to Discord or
+    Drive. For example, after `kb requeue`, `--pull --source discord` saves Discord's
+    messages for extraction without exporting every Drive file again.
 
     Use --dry-run first to see the token and cost estimate, and --limit 5 for a small
     first real run. The docs themselves arrive in M4.
@@ -124,7 +132,15 @@ def update(
         raise click.UsageError(
             "--full applies to reading Discord; it can't be used with --extract."
         )
-    _run(dry_run, full, rebuild=False, force_unlock=force_unlock, steps=steps, limit=limit)
+    _run(
+        dry_run,
+        full,
+        rebuild=False,
+        force_unlock=force_unlock,
+        steps=steps,
+        limit=limit,
+        read=read or upd.SOURCES,
+    )
 
 
 @main.command()

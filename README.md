@@ -258,6 +258,7 @@ kb update --dry-run   # show what's new and the token/cost estimate; no LLM call
 kb update --limit 5   # extract only 5 items (Discord and Drive alternating); the rest wait
 kb update --pull      # only read Discord and Drive; new items wait as `pending`
 kb update --extract   # only extract pending items, from what the last pull saved in raw/
+kb update --source discord   # only read and extract Discord (or `drive`); works with the flags above
 kb status             # last run, lock, cursors, item counts, errors, skipped files, records
 kb update --full      # rare: read the whole Discord channel and export every Drive file again
 kb rebuild            # rare: extract everything again (e.g. after a big prompt change)
@@ -314,11 +315,16 @@ Then look at the records in `_state/extracted.jsonl` (also in `data/state/`). Wh
 
 ```bash
 kb requeue
-kb update --dry-run --limit 10   # cost of a 10-item sample
-kb update --limit 10             # re-reads Discord, re-exports Drive files, extracts 10 items
-kb update --extract              # the rest, with Drive files from raw/drive/
+kb update --pull --source discord          # re-read Discord and save its messages; Drive isn't exported
+kb update --extract --dry-run --limit 10   # cost of a 10-item sample
+kb update --extract --limit 10             # the sample: Discord from saved messages, Drive from raw/drive/
+kb update --extract                        # the rest
 ```
 
-Each item keeps its old records until its new ones replace them, so for a while some records come from the old prompt (`prompt_version` on each record says which). `kb update --extract` can't extract a Discord item it has no saved messages for. Those wait for the next `kb update` that reads Discord, and the run says how many there are.
+Each item keeps its old records until its new ones replace them, so for a while some records come from the old prompt (`prompt_version` on each record says which).
+
+The Discord pull is needed because only a hash of each message is kept once it's extracted, so `kb update --extract` has nothing to re-extract a Discord item from until Discord is read again. Drive files don't need it: their text is in `raw/drive/`. A plain `kb update --limit 10` works too, but it exports every Drive file again first, since they all count as not extracted.
+
+`--source discord` or `--source drive` limits any `kb update` to one source: only that source is read, and only its items are extracted. A Discord-only run doesn't move the "last run started" time that Drive's "modified since the last run" check uses, so Drive edits made in the meantime are still picked up by the next run that reads Drive.
 
 **If a run fails,** nothing in `_state/` changes and the next run starts from the same place. If a run is killed hard (e.g. the laptop closes), its lock stays behind; after `state.lock_timeout_minutes` (default 60) it counts as stale and `kb update --force-unlock` clears it.

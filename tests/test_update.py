@@ -784,6 +784,66 @@ def test_requeue_only_clears_then_limit_and_extract_redo_everything(world):
     assert world.run().extracted.usage.requests == 0
 
 
+def test_requeue_then_discord_pull_then_extract_never_exports_drive(world):
+    old_ids = {r["record_id"] for r in world.records()}
+    upd.requeue(world.cfg, kb_folder=world.kb, clock=lambda: world.now)
+
+    r = world.run(steps=["pull"], read=["discord"])
+    assert world.drive.exports == [] and world.llm.requests == []
+    s = statuses(world)
+    assert all(s[k] == "pending" for k in s if k.startswith("discord"))
+    assert world.state()["run_log"][-1]["sources"] == ["discord"]
+    assert "--source discord" in "\n".join(upd.status(world.cfg, kb_folder=world.kb))
+
+    world.run(steps=["extract"], limit=2)  # a sample from saved messages and raw/drive/
+    assert len(world.llm.requests) == 2
+    world.run(steps=["extract"])
+    assert len(world.llm.requests) == 3 and world.drive.exports == []
+    assert set(statuses(world).values()) == {"ok"}
+    recs = world.records()
+    assert len(recs) == 6 and not {x["record_id"] for x in recs} & old_ids
+    assert r.drive.new == []
+
+
+def test_discord_only_run_leaves_drive_edits_for_the_next_run(world):
+    drive_cursor = world.state()["cursors"]["last_run_started_at"]
+    world.drive.add("a", "body a, edited", world.now - timedelta(minutes=5))
+    world.discord.channel.append(msg(12, "new"))
+    world.run(read=["discord"])
+    assert world.drive.exports == [] and len(world.llm.requests) == 1
+    assert world.state()["cursors"]["last_run_started_at"] == drive_cursor
+
+    r = world.run()
+    assert [f["id"] for f in r.drive.changed] == ["a"]
+    assert item_ids(r) == []  # Discord's cursors moved on the earlier run
+
+
+def test_drive_only_run_leaves_discord_for_the_next_run(world):
+    cursors = world.state()["cursors"]
+    world.discord.channel.append(msg(12, "new"))
+    world.drive.add("c", "body c", world.now - timedelta(minutes=5))
+    world.run(read=["drive"])
+    assert world.drive.exports == ["c"] and len(world.llm.requests) == 1
+    after = world.state()["cursors"]
+    assert after["discord_channel"] == cursors["discord_channel"]
+    assert after["last_run_started_at"] != cursors["last_run_started_at"]
+
+    r = world.run()
+    assert item_ids(r) == ["discord-msg:12"]
+
+
+def test_extract_only_with_source_extracts_only_that_source(fresh):
+    fresh.run(steps=["pull"])
+    fresh.run(steps=["extract"], read=["drive"])
+    s = statuses(fresh)
+    assert s["drive:a"] == s["drive:b"] == "ok"
+    assert {k for k, v in s.items() if v == "pending"} == {
+        "discord-msg:10",
+        "discord-msg:11",
+        "discord-thread:20",
+    }
+
+
 def test_requeue_respects_the_run_lock(world):
     upd.st.Lock(world.kb.subfolder(st.STATE_FOLDER), clock=lambda: world.now).acquire()
     with pytest.raises(st.LockError):

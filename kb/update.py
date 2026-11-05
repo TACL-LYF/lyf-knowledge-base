@@ -20,6 +20,9 @@ State is uploaded only at step 6, so a run that fails earlier changes nothing an
 next run starts from the same place (answers already received from the model are cached
 locally, so they aren't paid for twice). Publishing (M4) slots in before step 6.
 
+Sources: `--source discord` or `--source drive` reads, and extracts, only that source.
+`cursors.last_run_started_at` is Drive's cursor and moves only when Drive is read.
+
 Steps: `--pull` runs 1–4 and 6, leaving new items `pending`; `--extract` skips 2–4 and
 extracts pending items (Discord items keep their messages in the manifest; Drive files
 are read from their raw snapshot in Drive). `--limit N` extracts at most N items and
@@ -624,6 +627,7 @@ def build_items(
 
 
 STEPS = ("pull", "extract")  # M4 adds "synthesize"
+SOURCES = ("discord", "drive")
 
 
 def pick(items: list[Any], limit: int | None) -> tuple[list[Any], list[Any]]:
@@ -683,17 +687,22 @@ def waiting_items(
     raw: RawSnapshots,
     limit: int | None = None,
     detail: Log = lambda _: None,
+    read: Iterable[str] = SOURCES,
 ) -> Waiting:
     """Discord items with saved messages, and Drive files with a raw snapshot, to extract.
 
     Only the snapshots of the items chosen for this run (the first `limit`, picked as
     `pick` does) are downloaded; the rest are listed in `deferred` without being read.
+    Only items from the sources in `read` are considered.
     """
+    read = set(read)
     out = Waiting()
     candidates: list[Any] = []  # Discord items and Drive candidates, in manifest order
     for item_id, entry in manifest.items():
         status = entry.get("status")
         if entry.get("source") == "discord":
+            if "discord" not in read:
+                continue
             retry = entry.get("retry_item")
             if status in ("error", "pending") and retry:
                 out.retry_items[item_id] = retry
@@ -705,7 +714,7 @@ def waiting_items(
             elif needs_extraction(entry):
                 out.need_pull.append(str(entry.get("title") or item_id))
             continue
-        if not item_id.startswith("drive:"):
+        if not item_id.startswith("drive:") or "drive" not in read:
             continue
         if not (
             status == "pending"
@@ -769,6 +778,7 @@ def run_update(
     rebuild: bool = False,
     steps: Iterable[str] = STEPS,
     limit: int | None = None,
+    read: Iterable[str] = SOURCES,
     force_unlock: bool = False,
     log: Log = print,
     sources: Sources | None = None,
@@ -778,17 +788,26 @@ def run_update(
     snapshots), `extract` (send items to the model). With only `pull`, new items are
     saved as `pending`; with only `extract`, the pending items are extracted from what
     the last pull saved. `limit` caps how many items are extracted; the rest wait.
+
+    `read` picks the sources (`discord`, `drive`): only those are read, and only their
+    items are extracted. The Drive cursor (`last_run_started_at`) moves only when Drive
+    is read, so a Discord-only run doesn't hide Drive edits from the next run.
     """
     steps = set(steps)
     unknown = steps - set(STEPS)
     if unknown or not steps:
         raise ValueError(f"steps must be some of {', '.join(STEPS)}, got {sorted(steps)}")
+    read = set(read)
+    if read - set(SOURCES) or not read:
+        raise ValueError(f"read must be some of {', '.join(SOURCES)}, got {sorted(read)}")
+    read_discord, read_drive = "discord" in read, "drive" in read
     pulling, extracting = "pull" in steps, "extract" in steps
     stages = Stages(log, total=9 if sources is None else 8)
     flags = [
         "--full" if full else "",
         "" if steps == set(STEPS) else " ".join(f"--{x}" for x in STEPS if x in steps),
         f"--limit {limit}" if limit is not None else "",
+        "" if read == set(SOURCES) else " ".join(f"--source {x}" for x in SOURCES if x in read),
     ]
     mode = " (dry run: nothing will be saved)" if dry_run else ""
     log(f"kb {'rebuild' if rebuild else 'update'}" + "".join(f" {f}" for f in flags if f) + mode)
@@ -834,6 +853,7 @@ def run_update(
             "dry_run": dry_run,
             "steps": [x for x in STEPS if x in steps],
             "limit": limit,
+            "sources": [x for x in SOURCES if x in read],
         }
 
         discord, drive, retried = DiscordChanges(items=[]), DriveChanges(), []
@@ -842,7 +862,14 @@ def run_update(
         waiting: Waiting | None = None
         if pulling:
             pull, discord, retried, drive, files_by_id = _pull(
-                cfg, state, sources, stages, full=full, rebuild=rebuild
+                cfg,
+                state,
+                sources,
+                stages,
+                full=full,
+                rebuild=rebuild,
+                read_discord=read_discord,
+                read_drive=read_drive,
             )
             items = build_items(discord, retried, drive, files_by_id)
         else:
@@ -851,7 +878,11 @@ def run_update(
             with stages.stage("Loading items waiting for extraction") as s:
                 s.detail("listing raw/drive/ in the Knowledge Base folder")
                 waiting = waiting_items(
-                    state.manifest, _raw_snapshots(sources.kb_folder), limit, s.detail
+                    state.manifest,
+                    _raw_snapshots(sources.kb_folder) if read_drive else _NoSnapshots(),
+                    limit,
+                    s.detail,
+                    read=read,
                 )
                 items = waiting.items
                 s.result = f"{_plural(len(items), 'item')} to extract"
@@ -926,17 +957,17 @@ def run_update(
         with stages.stage("Saving state to Drive") as s:
             cursors_before = dict(state.cursors)
             tokens = {i.id: i.tokens for i in result.items}
-            if pull is not None:
+            if pull is not None:  # Discord was read
                 apply_discord(state, pull, discord, started_at, result.extracted, retried)
+                ext.mark_removed(
+                    store.citations, message_ids=[d["message_id"] for d in discord.deleted]
+                )
+            if pulling and read_drive:
                 apply_drive(state, drive, started_at, result.extracted, tokens)
                 for f in drive.skipped:
                     store.citations.refresh_drive(state.manifest[f"drive:{f['id']}"])
-                ext.mark_removed(
-                    store.citations,
-                    drive_ids=drive.removed,
-                    message_ids=[d["message_id"] for d in discord.deleted],
-                )
-                state.cursors["last_run_started_at"] = started_at
+                ext.mark_removed(store.citations, drive_ids=drive.removed)
+                state.cursors["last_run_started_at"] = started_at  # Drive's cursor
             if waiting is not None:
                 apply_waiting(state, waiting, result.extracted, started_at)
             run.update({"finished_at": st.now_iso(), "summary": summarize(result)})
@@ -964,8 +995,10 @@ def _pull(
     *,
     full: bool,
     rebuild: bool,
+    read_discord: bool = True,
+    read_drive: bool = True,
 ) -> tuple[
-    dsc.DiscordPull,
+    dsc.DiscordPull | None,
     DiscordChanges,
     list[dict[str, Any]],
     DriveChanges,
@@ -974,32 +1007,18 @@ def _pull(
     """Read Discord past the cursors, list Drive, and export new and changed files.
 
     A dry run exports too (read-only): the size and cost estimate needs the text.
+    A source that isn't read is skipped, and comes back empty (Discord's pull as None).
     """
-    first = state.cursors.get("last_run_started_at") is None
-    catch_up = any(
-        e.get("source") == "discord" and needs_extraction(e) for e in state.manifest.values()
-    )
-    how = (
-        "everything (--full)"
-        if full
-        else "everything (rebuild)"
-        if rebuild
-        else "everything (first run)"
-        if first
-        else "everything (catching up on items never extracted)"
-        if catch_up
-        else "messages after the saved cursors"
-    )
-    with stages.stage(f"Reading Discord: {how}") as s:
-        read_all = full or rebuild or first or catch_up
-        pull = sources.discord_fetch(None if read_all else state.cursors, full or rebuild)
-        discord = plan_discord(pull, state.manifest)
-        retried = discord_retries(state.manifest, discord)
-        for w in pull.warnings:
-            s.detail(f"warning: {w}")
-        s.result = discord_result(discord, full)
-        if retried:
-            s.result += f"; {_plural(len(retried), 'item')} waiting from earlier runs"
+    files_by_id: dict[str, dict[str, Any]] = {}
+    if not read_discord:
+        stages.skip("Reading Discord", "--source drive")
+        pull, discord, retried = None, DiscordChanges(items=[]), []
+    else:
+        pull, discord, retried = _read_discord(state, sources, stages, full=full, rebuild=rebuild)
+    if not read_drive:
+        stages.skip("Listing Drive files", "--source discord")
+        stages.skip("Exporting new and modified Drive files", "--source discord")
+        return pull, discord, retried, DriveChanges(), files_by_id
 
     with stages.stage("Listing Drive files and comparing to the manifest") as s:
         files = sources.drive_list()
@@ -1034,6 +1053,43 @@ def _pull(
     return pull, discord, retried, drive, files_by_id
 
 
+def _read_discord(
+    state: st.State,
+    sources: Sources,
+    stages: Stages,
+    *,
+    full: bool,
+    rebuild: bool,
+) -> tuple[dsc.DiscordPull, DiscordChanges, list[dict[str, Any]]]:
+    """Read Discord past the saved cursors (or all of it), and plan what to extract."""
+    first = state.cursors.get("discord_channel") is None
+    catch_up = any(
+        e.get("source") == "discord" and needs_extraction(e) for e in state.manifest.values()
+    )
+    how = (
+        "everything (--full)"
+        if full
+        else "everything (rebuild)"
+        if rebuild
+        else "everything (first run)"
+        if first
+        else "everything (catching up on items never extracted)"
+        if catch_up
+        else "messages after the saved cursors"
+    )
+    with stages.stage(f"Reading Discord: {how}") as s:
+        read_all = full or rebuild or first or catch_up
+        pull = sources.discord_fetch(None if read_all else state.cursors, full or rebuild)
+        discord = plan_discord(pull, state.manifest)
+        retried = discord_retries(state.manifest, discord)
+        for w in pull.warnings:
+            s.detail(f"warning: {w}")
+        s.result = discord_result(discord, full)
+        if retried:
+            s.result += f"; {_plural(len(retried), 'item')} waiting from earlier runs"
+    return pull, discord, retried
+
+
 class _RemoteSnapshots:
     """Drive files' raw snapshots in raw/drive/ in the Knowledge Base folder.
 
@@ -1058,6 +1114,16 @@ class _RemoteSnapshots:
         if fid is None or self.folder is None:
             return None
         return self.folder.read_id(fid).decode("utf-8")
+
+
+class _NoSnapshots:
+    """Stands in for raw/drive/ when Drive isn't read (`--source discord`)."""
+
+    def has(self, file_id: str) -> bool:
+        return False
+
+    def read(self, file_id: str) -> str | None:
+        return None
 
 
 def _raw_snapshots(kb_folder: st.RemoteFolder) -> RawSnapshots:
@@ -1251,6 +1317,11 @@ def status_lines(state: st.State, lock: dict[str, Any] | None) -> list[str]:
             "requeue" if last.get("requeue") else "",
             *(f"--{x}" for x in last.get("steps") or STEPS if len(last.get("steps") or STEPS) == 1),
             f"--limit {last['limit']}" if last.get("limit") is not None else "",
+            *(
+                f"--source {x}"
+                for x in last.get("sources") or SOURCES
+                if len(last.get("sources") or SOURCES) == 1
+            ),
         ]
         flags = [f for f in flags if f]
         out.append(
