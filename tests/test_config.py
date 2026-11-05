@@ -15,7 +15,8 @@ drive:
     - "src2"
   kb_folder_id: "kb"
 llm:
-  model: test-model
+  extract_model: extract-model
+  synthesis_model: synthesis-model
 """
 
 
@@ -42,7 +43,8 @@ def test_loads_ids_and_secrets(tmp_path):
     assert cfg.discord_channel_id == "222"
     assert cfg.drive_source_folder_ids == ["src1", "src2"]
     assert cfg.drive_kb_folder_id == "kb"
-    assert cfg.llm_model == "test-model"
+    assert cfg.llm_extract_model == "extract-model"
+    assert cfg.llm_synthesis_model == "synthesis-model"
     assert cfg.discord_bot_token == "tok"
     assert cfg.google_credentials_path == tmp_path / "secrets/key.json"
     assert cfg.data_dir == tmp_path / "data"
@@ -90,3 +92,14 @@ def test_old_source_folder_id_key_is_rejected(tmp_path):
 
 def test_message_link():
     assert message_link("1", "2", "3") == "https://discord.com/channels/1/2/3"
+
+
+def test_models_default_when_unset(tmp_path):
+    cfg = load_config(write(tmp_path, CONFIG.split("llm:")[0]))
+    assert cfg.llm_extract_model == "claude-opus-5-5"
+    assert cfg.llm_synthesis_model == "claude-opus-5-5"
+
+
+def test_old_single_model_setting_is_rejected(tmp_path):
+    with pytest.raises(ConfigError, match="extract_model"):
+        load_config(write(tmp_path, CONFIG.split("llm:")[0] + "llm:\n  model: x\n"))
