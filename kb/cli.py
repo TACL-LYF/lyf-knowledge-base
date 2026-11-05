@@ -101,7 +101,9 @@ def main() -> None:
     multiple=True,
     help="Only read and extract this source (repeatable). Default: all.",
 )
-@click.option("--force-unlock", is_flag=True, help="Clear a stale run lock before starting.")
+@click.option(
+    "--force-unlock", is_flag=True, help="Clear a stale run lock, or your own, before starting."
+)
 def update(
     dry_run: bool,
     full: bool,
@@ -187,7 +189,9 @@ def status() -> None:
 @main.command()
 @click.option("--dry-run", is_flag=True, help="Show the token and cost estimate only.")
 @click.option("--yes", is_flag=True, help="Don't ask for confirmation.")
-@click.option("--force-unlock", is_flag=True, help="Clear a stale run lock before starting.")
+@click.option(
+    "--force-unlock", is_flag=True, help="Clear a stale run lock, or your own, before starting."
+)
 def rebuild(dry_run: bool, yes: bool, force_unlock: bool) -> None:
     """Extract everything again (e.g., after a big prompt change).
 
@@ -205,7 +209,9 @@ def rebuild(dry_run: bool, yes: bool, force_unlock: bool) -> None:
 
 
 @main.command()
-@click.option("--force-unlock", is_flag=True, help="Clear a stale run lock before starting.")
+@click.option(
+    "--force-unlock", is_flag=True, help="Clear a stale run lock, or your own, before starting."
+)
 def requeue(force_unlock: bool) -> None:
     """Mark every item to be extracted again, without extracting anything yet.
 

@@ -1,3 +1,6 @@
+import os
+import signal
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -38,12 +41,59 @@ def test_lock_release_is_idempotent():
     assert folder.list() == []
 
 
-def test_fresh_lock_cannot_be_forced():
+def test_someone_elses_fresh_lock_cannot_be_forced():
     folder = st.MemoryFolder()
     st.Lock(folder, holder="busy", clock=lambda: NOW).acquire()
-    later = st.Lock(folder, timeout_minutes=60, clock=lambda: NOW + timedelta(minutes=10))
-    with pytest.raises(st.LockError, match="in progress"):
+    later = st.Lock(
+        folder, timeout_minutes=60, holder="me", clock=lambda: NOW + timedelta(minutes=10)
+    )
+    with pytest.raises(st.LockError, match="in progress.*Wait for it to finish"):
         later.acquire(force_unlock=True)
+    assert st.read_lock(folder)["holder"] == "busy"
+
+
+def test_own_fresh_lock_can_be_forced():
+    # e.g. left behind when a run of ours was interrupted
+    folder = st.MemoryFolder()
+    st.Lock(folder, holder="me", clock=lambda: NOW).acquire()
+    later = st.Lock(
+        folder, timeout_minutes=60, holder="me", clock=lambda: NOW + timedelta(minutes=10)
+    )
+    with pytest.raises(st.LockError, match="in progress.*--force-unlock"):
+        later.acquire()
+    later.acquire(force_unlock=True)
+    assert later.cleared and "held by me" in later.cleared
+    assert [f["id"] for f in folder.list()] == [later.file_id]
+
+
+def test_stale_lock_needs_force_and_is_then_cleared():
+    folder = st.MemoryFolder()
+    st.Lock(folder, holder="crashed", clock=lambda: NOW).acquire()
+    later = st.Lock(
+        folder, timeout_minutes=60, holder="me", clock=lambda: NOW + timedelta(minutes=61)
+    )
+    with pytest.raises(st.LockError, match="stale"):
+        later.acquire()
+    later.acquire(force_unlock=True)
+    assert st.read_lock(folder)["holder"] == "me"
+
+
+def test_ctrl_c_during_release_still_releases_then_interrupts():
+    folder = st.MemoryFolder()
+    lock = st.Lock(folder, clock=lambda: NOW)
+    lock.acquire()
+    real_trash = folder.trash_id
+
+    def trash_with_ctrl_c(file_id):
+        os.kill(os.getpid(), signal.SIGINT)  # pressed while the lock is being deleted
+        time.sleep(0.05)
+        real_trash(file_id)
+
+    folder.trash_id = trash_with_ctrl_c
+    with pytest.raises(KeyboardInterrupt):
+        lock.release()
+    assert folder.list() == [] and lock.file_id is None
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
 
 
 def test_download_replaces_local_copy_and_upload_round_trips(tmp_path):

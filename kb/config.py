@@ -24,6 +24,7 @@ DEFAULT_EXTRACT_MODEL = "claude-opus-5-5"
 DEFAULT_SYNTHESIS_MODEL = "claude-opus-5-5"
 DEFAULT_MAX_ITEM_TOKENS = 100_000
 DEFAULT_BATCH_MIN_REQUESTS = 20
+DEFAULT_EXPORT_WORKERS = 8  # Drive files exported at once
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 # Programming types where each occurrence has its own content (a workshop on one topic,
 # then another on a different one), so records name the session. See PLAN.md.
@@ -42,6 +43,7 @@ class Config:
     drive_kb_folder_id: str
     drive_file_types: list[str] = field(default_factory=lambda: list(DEFAULT_FILE_TYPES))
     drive_allow_large_files: list[str] = field(default_factory=list)
+    drive_export_workers: int = DEFAULT_EXPORT_WORKERS
     llm_extract_model: str = DEFAULT_EXTRACT_MODEL
     llm_synthesis_model: str = DEFAULT_SYNTHESIS_MODEL
     llm_extract_effort: str | None = None  # None: the model's default
@@ -131,6 +133,16 @@ def load_config(path: Path | None = None, env_file: Path | None = None) -> Confi
         else [" ".join(str(t).split()) for t in _id_list(per_session)]
     )
 
+    workers = drive.get("export_workers")
+    try:
+        export_workers = DEFAULT_EXPORT_WORKERS if workers is None else int(workers)
+    except (TypeError, ValueError):
+        export_workers = 0
+    if export_workers < 1:
+        raise ConfigError(
+            f"drive.export_workers must be a whole number of at least 1, not {workers!r}."
+        )
+
     creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
 
     return Config(
@@ -145,6 +157,7 @@ def load_config(path: Path | None = None, env_file: Path | None = None) -> Confi
         llm_max_item_tokens=int(llm.get("max_item_tokens") or DEFAULT_MAX_ITEM_TOKENS),
         llm_batch_min_requests=int(llm.get("batch_min_requests") or DEFAULT_BATCH_MIN_REQUESTS),
         drive_allow_large_files=_id_list(drive.get("allow_large_files")),
+        drive_export_workers=export_workers,
         per_session_types=per_session_types,
         lock_timeout_minutes=int(state.get("lock_timeout_minutes") or 60),
         data_dir=_resolve(str(paths.get("data_dir") or "data"), base),

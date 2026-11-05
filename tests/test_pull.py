@@ -25,7 +25,7 @@ def drive_file(id, mime=gdrive.DOC_MIME):
 
 def test_drive_pull_writes_files_and_keeps_going_after_an_error(tmp_path, monkeypatch):
     files = [drive_file("a"), drive_file("bad"), drive_file("c", gdrive.SLIDES_MIME)]
-    monkeypatch.setattr(gdrive, "list_folder_files", lambda *a: iter(files))
+    monkeypatch.setattr(gdrive, "list_folder_files", lambda *a, **kw: iter(files))
 
     def export(services, f):
         if f["id"] == "bad":
@@ -38,7 +38,9 @@ def test_drive_pull_writes_files_and_keeps_going_after_an_error(tmp_path, monkey
     (raw / "drive").mkdir()
     (raw / "drive" / "stale.md").write_text("old")
 
-    result = pull.pull_drive(cfg(tmp_path), raw, lambda _: None, services=FAKE_SERVICES)
+    result = pull.pull_drive(
+        cfg(tmp_path), raw, lambda _: None, make_services=lambda: FAKE_SERVICES
+    )
 
     assert sorted(p.name for p in (raw / "drive").iterdir()) == ["a.md", "c.md"]
     assert "body of c" in (raw / "drive" / "c.md").read_text()
@@ -48,7 +50,7 @@ def test_drive_pull_writes_files_and_keeps_going_after_an_error(tmp_path, monkey
 
 
 def test_failed_pull_leaves_previous_output(tmp_path, monkeypatch):
-    def boom(*a):
+    def boom(*a, **kw):
         raise RuntimeError("listing failed")
         yield  # pragma: no cover
 
@@ -58,7 +60,7 @@ def test_failed_pull_leaves_previous_output(tmp_path, monkeypatch):
     (raw / "drive" / "keep.md").write_text("old")
 
     with pytest.raises(RuntimeError):
-        pull.pull_drive(cfg(tmp_path), raw, lambda _: None, services=FAKE_SERVICES)
+        pull.pull_drive(cfg(tmp_path), raw, lambda _: None, make_services=lambda: FAKE_SERVICES)
     assert (raw / "drive" / "keep.md").read_text() == "old"
 
 

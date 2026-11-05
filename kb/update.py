@@ -73,13 +73,14 @@ class Sources:
     # cursors (None = full read), refresh_names → DiscordPull
     discord_fetch: Callable[[dict[str, Any] | None, bool], dsc.DiscordPull]
     drive_list: Callable[[], list[dict[str, Any]]]
-    drive_export: Callable[[dict[str, Any]], str]
+    drive_export: Callable[[dict[str, Any]], str]  # must be thread-safe (export_files)
     kb_folder: st.RemoteFolder
     llm: llm_mod.LLM | None = None  # None: no extraction possible (e.g. a dry run)
 
     @classmethod
     def real(cls, cfg: Config, log: Log) -> Sources:
-        services = gdrive.Services.from_key(cfg.google_credentials_path)
+        creds = gdrive.credentials(cfg.google_credentials_path)
+        services = gdrive.Services.from_credentials(creds)
         cache = dsc.MemberCache(cfg.data_dir / MEMBER_CACHE)
         client: llm_mod.LLM | None = None
         if cfg.anthropic_api_key:
@@ -110,10 +111,16 @@ class Sources:
             discord_fetch=discord_fetch,
             drive_list=lambda: list(
                 gdrive.list_folder_files(
-                    services.drive, cfg.drive_source_folder_ids, cfg.drive_file_types, log
+                    services.drive,
+                    cfg.drive_source_folder_ids,
+                    cfg.drive_file_types,
+                    log,
+                    make_drive=lambda: gdrive.Services.from_credentials(creds).drive,
+                    workers=cfg.drive_export_workers,
                 )
             ),
-            drive_export=lambda f: gdrive.export_text(services, f),
+            # Called from several threads at once, so each builds its own clients.
+            drive_export=gdrive.threaded_export(lambda: gdrive.Services.from_credentials(creds)),
             kb_folder=st.DriveFolder(services.drive, cfg.drive_kb_folder_id),
             llm=client,
         )
@@ -349,10 +356,14 @@ class DriveChanges:
     modified: list[dict[str, Any]] = field(default_factory=list)  # modified since last run
     skipped: list[dict[str, Any]] = field(default_factory=list)  # not modified since last run
     removed: list[str] = field(default_factory=list)  # manifest IDs no longer listed
+    # of `modified`: files not edited since the last run, listed only to be extracted
+    not_edited: set[str] = field(default_factory=set)
     # filled in after export:
     exported: dict[str, str] = field(default_factory=dict)  # file ID → body
     changed: list[dict[str, Any]] = field(default_factory=list)  # modified and text differs
     unchanged: list[dict[str, Any]] = field(default_factory=list)  # modified but text same
+    # same text as last time, but not extracted yet (pending, or its extraction failed):
+    waiting: list[dict[str, Any]] = field(default_factory=list)
     errors: dict[str, str] = field(default_factory=dict)  # file ID → error message
 
 
@@ -384,16 +395,16 @@ def classify_drive(
             out.new.append(f)
             continue
         modified = st.parse_time(f.get("modifiedTime"))
-        if (
-            full
-            or entry.get("status") in ("error", "pending")
+        edited = full or since is None or modified is None or modified > since
+        if edited:
+            out.modified.append(f)
+        elif (
+            entry.get("status") in ("error", "pending")
             or needs_extraction(entry)
             or (entry.get("status") == "skipped" and retry_skipped(f["id"], entry))
-            or since is None
-            or modified is None
-            or modified > since
         ):
             out.modified.append(f)
+            out.not_edited.add(f["id"])
         else:
             out.skipped.append(f)
     out.removed = [
@@ -409,28 +420,33 @@ def export_drive(
     manifest: dict[str, dict[str, Any]],
     export: Callable[[dict[str, Any]], str],
     log: Log,
+    workers: int = gdrive.DEFAULT_EXPORT_WORKERS,
 ) -> None:
+    """Export new and modified files, `workers` at a time; results are handled in order."""
     todo = changes.new + changes.modified
     modified_ids = {f["id"] for f in changes.modified}
     width = len(str(len(todo)))
-    for n, f in enumerate(todo, 1):
+    for n, r in enumerate(gdrive.export_files(todo, export, workers), 1):
+        f = r.file
         label = f"({n:>{width}}/{len(todo)}) {f.get('name') or f['id']}"
-        try:
-            body = export(f)
-        except Exception as e:  # one bad file shouldn't stop the run
-            changes.errors[f["id"]] = f"{type(e).__name__}: {e}"
-            log(f"{label}: error: {changes.errors[f['id']]}")
+        if r.error is not None:  # one bad file shouldn't stop the run
+            changes.errors[f["id"]] = r.error
+            log(f"{label}: error: {r.error}")
         else:
+            assert r.body is not None
+            body = r.body
             changes.exported[f["id"]] = body
             if f["id"] in modified_ids:
                 entry = manifest.get(f"drive:{f['id']}") or {}
-                same = (
-                    entry.get("status") == "ok"
-                    and not needs_extraction(entry)
-                    and entry.get("content_hash") == content_hash(body)
-                )
-                (changes.unchanged if same else changes.changed).append(f)
-                log(f"{label}: {'same text, skipped' if same else 'changed'}")
+                if entry.get("content_hash") != content_hash(body):
+                    changes.changed.append(f)
+                    log(f"{label}: changed")
+                elif entry.get("status") == "ok" and not needs_extraction(entry):
+                    changes.unchanged.append(f)
+                    log(f"{label}: same text, skipped")
+                else:  # listed because it still needs extracting, not because it changed
+                    changes.waiting.append(f)
+                    log(f"{label}: same text, waiting for extraction")
             else:
                 log(f"{label}: new")
 
@@ -495,8 +511,10 @@ def save_raw(
 
     Discord: one file per day, `discord/YYYY-MM-DD.json`, holding every run that day (by
     anyone: the copy in Drive is read first, so teammates' runs aren't overwritten).
-    Drive: `drive/<fileId>.md`, the latest export of each new or changed file. With
-    `--full`, every exported file is written, so `raw/drive/` is filled in completely.
+    Drive: `drive/<fileId>.md`, the latest export of each new or changed file. Files
+    still waiting for extraction with the same text are only written if raw/drive/ has
+    no copy yet. With `--full`, every exported file is written, so `raw/drive/` is
+    filled in completely.
     """
     raw_dir = cfg.data_dir / "raw"
     remote_raw = kb_folder.subfolder(st.RAW_FOLDER)
@@ -527,8 +545,11 @@ def save_raw(
         local.write_text(text, encoding="utf-8")
         remote_discord.write(local.name, text.encode("utf-8"))
 
-    unchanged = {f["id"] for f in drive.unchanged}
-    to_write = [fid for fid in drive.exported if run["full"] or fid not in unchanged]
+    same_text = {f["id"] for f in drive.unchanged + drive.waiting}
+    to_write = [fid for fid in drive.exported if run["full"] or fid not in same_text]
+    if drive.waiting and not run["full"]:  # e.g. pulled before snapshots were uploaded
+        saved = _RemoteSnapshots(kb_folder)
+        to_write += [f["id"] for f in drive.waiting if not saved.has(f["id"])]
     if to_write:
         (raw_dir / "drive").mkdir(parents=True, exist_ok=True)
         remote_drive = remote_raw.subfolder("drive")
@@ -620,7 +641,7 @@ def build_items(
         )
         for i in [*discord.items, *retried]
     ]
-    for f in drive.new + drive.changed:
+    for f in drive.new + drive.changed + drive.waiting:
         if f["id"] in drive.exported:
             items.append(ext.drive_item(gdrive.file_metadata(f), drive.exported[f["id"]]))
     return items
@@ -827,6 +848,8 @@ def run_update(
     else:
         with stages.stage("Taking the run lock") as s:
             lock.acquire(force_unlock=force_unlock)
+            if lock.cleared:
+                s.detail(f"cleared the old lock ({lock.cleared})")
             s.result = f"lock taken by {lock.holder} (run {lock.run_id})"
     try:
         with stages.stage("Downloading state from Drive") as s:
@@ -1035,7 +1058,8 @@ def _pull(
         )
         s.result = (
             f"{_plural(len(files), 'file')}: {len(drive.new)} new, "
-            f"{len(drive.modified)} modified since the last run or not yet extracted, "
+            f"{len(drive.modified) - len(drive.not_edited)} modified since the last run, "
+            f"{len(drive.not_edited)} not yet extracted (or retried), "
             f"{len(drive.skipped)} unchanged, {len(drive.removed)} removed"
         )
 
@@ -1043,12 +1067,15 @@ def _pull(
     if not todo:
         stages.skip("Exporting new and modified Drive files", "nothing to export")
     else:
-        with stages.stage(f"Exporting {_plural(todo, 'new or modified Drive file')}") as s:
-            export_drive(drive, state.manifest, sources.drive_export, s.detail)
+        workers = cfg.drive_export_workers
+        title = f"Exporting {_plural(todo, 'new or modified Drive file')} ({workers} at a time)"
+        with stages.stage(title) as s, gdrive.RetryCounter() as retries:
+            export_drive(drive, state.manifest, sources.drive_export, s.detail, workers)
             s.result = (
                 f"{len(drive.new)} new, {len(drive.changed)} changed, "
                 f"{len(drive.unchanged)} with the same text (skipped), "
-                f"{_plural(len(drive.errors), 'error')}"
+                f"{len(drive.waiting)} with the same text waiting for extraction, "
+                f"{_plural(len(drive.errors), 'error')}{retries.summary()}"
             )
     return pull, discord, retried, drive, files_by_id
 
@@ -1150,7 +1177,7 @@ def _release(lock: st.Lock, log: Log) -> None:
         log(
             f"warning: the run lock couldn't be released ({type(e).__name__}: {e}). "
             "Everything above still applies. The next run will report the lock as held; "
-            "once it's stale, clear it with `kb update --force-unlock`."
+            "clear it with `kb update --force-unlock`."
         )
     else:
         log("Run lock released.")
@@ -1176,6 +1203,7 @@ def summarize(r: RunResult) -> dict[str, Any]:
             "new": len(g.new),
             "changed": len(g.changed),
             "unchanged_text": len(g.unchanged),
+            "waiting": len(g.waiting),
             "skipped": len(g.skipped),
             "removed": len(g.removed),
             "errors": len(g.errors),
@@ -1230,8 +1258,8 @@ def report(r: RunResult, manifest: dict[str, dict[str, Any]], log: Log, limit: i
 
         log(
             f"Drive: {g['new']} new, {g['changed']} changed, {g['unchanged_text']} modified "
-            f"with the same text (skipped), {g['skipped']} unchanged, {g['removed']} removed, "
-            f"{g['errors']} errors"
+            f"with the same text (skipped), {g['waiting']} waiting for extraction (same "
+            f"text), {g['skipped']} unchanged, {g['removed']} removed, {g['errors']} errors"
         )
         listing("  New:", [f.get("name", f["id"]) for f in r.drive.new])
         listing("  Changed:", [f.get("name", f["id"]) for f in r.drive.changed])
@@ -1434,6 +1462,8 @@ def requeue(
         return 0
     lock = st.Lock(folder, cfg.lock_timeout_minutes, clock=clock)
     lock.acquire(force_unlock=force_unlock)
+    if lock.cleared:
+        print(f"Cleared the old lock ({lock.cleared}).")
     try:
         local = cfg.data_dir / "state"
         st.download(folder, local)

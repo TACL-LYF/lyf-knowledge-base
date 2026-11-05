@@ -248,6 +248,8 @@ data/raw/
 
 Bot and system messages are left out. Docs are exported as markdown, Slides as slide text plus speaker notes, and Sheets as one table per tab. Source folders are read recursively. Archived **private** threads are skipped unless the bot has the Manage Threads permission.
 
+Drive folders are listed and files exported 8 at a time (`drive.export_workers` in `config.yaml`), which brought a full Drive pull of about 280 files from about 10 minutes down to about 1. `kb update` uses the same setting. If the run summary reports many rate-limited retries, lower it; set it to 1 to go back to one at a time.
+
 Looking up each author's server nickname takes one Discord API call per person, so nicknames are remembered in `data/raw/discord/members.json` and only new authors are looked up. Use `kb pull --refresh-names` after people change their nicknames.
 
 ### Full pipeline
@@ -327,4 +329,4 @@ The Discord pull is needed because only a hash of each message is kept once it's
 
 `--source discord` or `--source drive` limits any `kb update` to one source: only that source is read, and only its items are extracted. A Discord-only run doesn't move the "last run started" time that Drive's "modified since the last run" check uses, so Drive edits made in the meantime are still picked up by the next run that reads Drive.
 
-**If a run fails,** nothing in `_state/` changes and the next run starts from the same place. If a run is killed hard (e.g. the laptop closes), its lock stays behind; after `state.lock_timeout_minutes` (default 60) it counts as stale and `kb update --force-unlock` clears it.
+**If a run fails,** nothing in `_state/` changes and the next run starts from the same place. Ctrl-C stops a run cleanly: requests already sent are finished, the rest aren't sent, and the lock is released (a second Ctrl-C waits until it is). If a run is killed hard (e.g. the laptop closes), its lock stays behind. If it's your own lock (same user and machine), `kb update --force-unlock` clears it right away. Someone else's lock can only be cleared once it's stale, after `state.lock_timeout_minutes` (default 60), so a teammate's run that's still going is never interrupted.

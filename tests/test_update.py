@@ -945,6 +945,41 @@ def test_limit_extracts_some_items_and_the_next_run_does_the_rest(fresh):
     assert fresh.run().extracted.usage.requests == 0
 
 
+def test_waiting_files_are_not_reported_as_changed_or_uploaded_again(fresh):
+    fresh.run(steps=["pull"])  # both files saved, waiting for extraction
+    raw = fresh.kb.subfolder(st.RAW_FOLDER).subfolder("drive")
+    writes: list[str] = []
+    real = raw.write
+    raw.write = lambda name, *a, **kw: writes.append(name) or real(name, *a, **kw)
+    lines: list[str] = []
+    fresh.now += timedelta(hours=1)
+    r = upd.run_update(
+        fresh.cfg, log=lines.append, sources=fresh.sources(), clock=lambda: fresh.now
+    )
+    # Neither file was edited: both are exported to get their text, but not "changed".
+    assert r.drive.changed == [] and r.drive.unchanged == []
+    assert [f["id"] for f in r.drive.waiting] == ["a", "b"]
+    assert r.drive.not_edited == {"a", "b"}
+    assert writes == []  # raw/drive/ already has these exact snapshots
+    out = "\n".join(lines)
+    assert "0 modified since the last run, 2 not yet extracted" in out
+    assert "0 changed, 0 with the same text (skipped), 2 with the same text waiting" in out
+    assert "same text, waiting for extraction" in out
+    # They're still extracted.
+    assert statuses(fresh)["drive:a"] == statuses(fresh)["drive:b"] == "ok"
+    assert {r["item_id"] for r in fresh.records()} >= {"drive:a", "drive:b"}
+    assert fresh.state()["run_log"][-1]["summary"]["drive"]["waiting"] == 2
+
+
+def test_waiting_file_without_a_snapshot_in_drive_is_uploaded(fresh):
+    fresh.run(steps=["pull"])
+    raw = fresh.kb.subfolder(st.RAW_FOLDER).subfolder("drive")
+    raw.trash_id(next(f["id"] for f in raw.list() if f["name"] == "a.md"))
+    fresh.now += timedelta(hours=1)
+    fresh.run(steps=["pull"])
+    assert raw.read("a.md") is not None
+
+
 def test_pull_only_then_extract_only(fresh):
     r = fresh.run(steps=["pull"])
     assert fresh.llm.requests == [] and r.extracted.records == 0
