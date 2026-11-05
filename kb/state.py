@@ -4,6 +4,10 @@
     ├── cursors.json     Discord cursors + when the last successful run started
     ├── manifest.json    one entry per source item (Discord thread/message, Drive file)
     ├── run_log.json     history of runs
+    ├── citations.jsonl  running list of citations (kb/citations.py)
+    ├── extracted.jsonl  saved records (kb/extract.py)
+    ├── programming_types.json
+    ├── sessions.json    named sessions of per-session types (kb/extract.py)
     └── lock             held while a run is in progress
 
 Drive is the source of truth. A run takes the lock, downloads `_state/` into
@@ -26,12 +30,18 @@ from pathlib import Path
 from typing import Any, Protocol
 
 STATE_FOLDER = "_state"
+RAW_FOLDER = "raw"  # raw snapshots, next to _state/ in the Knowledge Base folder
 LOCK_NAME = "lock"
 
 CURSORS = "cursors.json"
 MANIFEST = "manifest.json"
 RUN_LOG = "run_log.json"
 STATE_FILES = (CURSORS, MANIFEST, RUN_LOG)
+# Written by extraction (kb/extract.py, kb/citations.py):
+CITATIONS = "citations.jsonl"
+EXTRACTED = "extracted.jsonl"
+PROGRAMMING_TYPES = "programming_types.json"
+SESSIONS = "sessions.json"
 
 RUN_LOG_KEEP = 200  # older run log entries are dropped
 
@@ -69,6 +79,9 @@ class RemoteFolder(Protocol):
 
     def read(self, name: str) -> bytes | None:
         """Contents of the file with this name, or None if there isn't one."""
+
+    def read_id(self, file_id: str) -> bytes:
+        """Contents of the file with this ID (from `list`)."""
 
     def write(self, name: str, data: bytes, mime: str = "application/json") -> None:
         """Create the file, or replace the contents of the existing one with this name."""
@@ -205,6 +218,9 @@ class MemoryFolder:
     def read(self, name: str) -> bytes | None:
         f = next((f for f in self.files if f["name"] == name), None)
         return None if f is None else f["data"]
+
+    def read_id(self, file_id: str) -> bytes:
+        return next(f["data"] for f in self.files if f["id"] == file_id)
 
     def write(self, name: str, data: bytes, mime: str = "application/json") -> None:
         f = next((f for f in self.files if f["name"] == name), None)

@@ -4,7 +4,7 @@ Collects feedback from a Discord channel and a set of Google Drive folders and p
 
 The full design and milestones are in [docs/PLAN.md](docs/PLAN.md).
 
-> **Status:** M2 (state and incremental runs). `kb update` reads only what's new since the last run and saves it, with state shared in Drive; `kb status` shows where things stand. Extraction and the Consolidated Feedback doc arrive in M3–M4.
+> **Status:** M3 (extraction and citations). `kb update` reads only what's new since the last run and turns it into cited records (feedback and program facts) with Claude, with state shared in Drive; `kb status` shows where things stand. The Consolidated Feedback and Programs docs arrive in M4.
 
 ## Contents
 
@@ -218,13 +218,13 @@ The pipeline keeps local copies of everything it fetches in `data/`, so you can 
 ```
 data/
 ├── raw/discord/    # fetched messages, per run (+ members.json, cached nicknames)
-├── raw/drive/      # exported text of Drive files
+├── raw/drive/      # exported text of Drive files (embedded images replaced by [image])
 └── state/          # local copy of the _state/ folder from Drive
 ```
 
 - `data/` is in `.gitignore` and is **never committed**. It contains other people's messages and documents.
 - **Drive is the source of truth for state.** Each run downloads `_state/` from Drive into `data/state/` and uploads it again at the end. Your local copy is only a cache.
-- **Raw copies stay local.** Fetched messages and exported file text are only saved in `data/raw/`, never uploaded to Drive, so they don't use up Drive storage.
+- **Raw copies are also saved in Drive.** `kb update` uploads the new messages and new or changed file exports to `raw/` in the Knowledge Base folder, so teammates can see what the model was given. Embedded images are removed from Doc exports, so all of it is only a few MB. `kb pull` stays local only.
 - You can delete `data/` at any time. The next run downloads state again, and raw files are fetched as needed.
 
 ## Running the pipeline
@@ -253,11 +253,16 @@ Looking up each author's server nickname takes one Discord API call per person, 
 ### Full pipeline
 
 ```bash
-kb update             # normal run: new Discord messages + new/changed Drive files
-kb update --dry-run   # show what's new, without saving anything (no lock, no Drive writes)
-kb status             # last run, lock, cursors, item counts, errors, programming types
-kb update --full      # rare: read the whole Discord channel again to find edited/deleted messages
-kb rebuild            # rare: extract everything again (M3)
+kb update             # normal run: new Discord messages + new/changed Drive files → records
+kb update --dry-run   # show what's new and the token/cost estimate; no LLM calls, nothing saved
+kb update --limit 5   # extract only 5 items (Discord and Drive alternating); the rest wait
+kb update --pull      # only read Discord and Drive; new items wait as `pending`
+kb update --extract   # only extract pending items, from what the last pull saved in raw/
+kb update --source discord   # only read and extract Discord (or `drive`); works with the flags above
+kb status             # last run, lock, cursors, item counts, errors, skipped files, records
+kb update --full      # rare: read the whole Discord channel and export every Drive file again
+kb rebuild            # rare: extract everything again (e.g. after a big prompt change)
+kb requeue            # mark everything to extract again; later `kb update` runs do it
 ```
 
 The first `kb update` reads everything, because there's no saved state yet. After that, each run only reads what's new:
@@ -266,6 +271,60 @@ The first `kb update` reads everything, because there's no saved state yet. Afte
 - **Drive:** files not seen before (including old files moved into a source folder), and files modified since the last run started. If a modified file's text is the same (for example, only a comment was added), it's skipped.
 - **Removed Drive files** are marked `removed` in the manifest.
 
-As of M2, a run saves the new content locally (`data/raw/discord/YYYY-MM-DD.json`, `data/raw/drive/<fileId>.md`) and updates `_state/` in Drive. Raw content is never uploaded to Drive. Extraction (M3) and the doc (M4) will plug into the same run.
+A run saves the new content locally (`data/raw/discord/YYYY-MM-DD.json`, `data/raw/drive/<fileId>.md`), uploads the same files to `raw/` in the Knowledge Base folder, extracts records from it, and updates `_state/` in Drive. The docs (M4) will plug into the same run.
+
+#### Extraction
+
+Each new or changed item (a Discord thread or channel message, or a Drive file) is sent to `llm.extract_model` with the prompt in `prompts/extract_v2.md`. The model returns **records**, saved in `_state/extracted.jsonl`:
+
+- `feedback`: an opinion, complaint, request, question, or praise, with a category, sentiment, and programming type (or none);
+- `program_info`: a `description` or `history` fact about a programming type.
+
+Every record has `applies_to` (the period it's about, `YYYY`, `YYYY-MM`, or `YYYY-MM-DD`) and `date_basis` (`stated`, `inferred`, or `source_date` when the source's own date was used), and cites the Discord messages or the Drive file it came from. Citations get permanent IDs (`C-0001`, …) in `_state/citations.jsonl`; programming types found so far are kept in `_state/programming_types.json` and given to the model so it reuses the same names.
+
+- **Run `kb update --dry-run` first.** It exports new and changed files (read-only) and shows the estimated tokens per item, the total, and the estimated cost, without calling the model. The first run after upgrading from M2 extracts everything read so far, so expect it to take a while; with 20 or more requests (`llm.batch_min_requests`) it goes through the Batch API at half price, which usually finishes within an hour.
+- **Large items are skipped.** Anything over `llm.max_item_tokens` (default 100,000, about 400 KB of text) is skipped and listed in the run summary and `kb status`. To extract a specific large file anyway, add its file ID to `drive.allow_large_files`; it's split into parts but still cited as one file.
+- **Failures don't stop the run.** A failed request is retried once; an item that still fails is marked `error` and tried again on the next run. Answers already received are cached in `data/cache/`, so a crashed run doesn't pay for them twice, and an interrupted batch is picked up again instead of being sent twice.
+- **Edited Drive files** have their records replaced (the citation ID stays the same). **Removed files and deleted messages** keep their records, but their citations are marked `removed`, so the docs leave them out.
+- Each run ends with a token and cost summary, also kept in the run log.
+
+#### Running steps separately
+
+By default `kb update` runs every step: pull (read Discord and Drive), then extract. M4 adds synthesize. `--pull` and `--extract` run just one step:
+
+- `--pull` reads and saves as usual (raw snapshots, manifest, cursors) but sends nothing to the model, so it doesn't need `ANTHROPIC_API_KEY`. New items get status `pending`. Discord items keep their messages in the manifest, because the cursors have moved past them.
+- `--extract` doesn't read Discord or Drive. It extracts pending items, items whose extraction failed, and Drive files never extracted. Drive files are read from their snapshot in `raw/drive/` in the Knowledge Base folder, so it extracts what the last pull saw. Discord items read before extraction existed have no saved messages, so they wait for a normal `kb update`.
+- `--limit N` (with or without `--extract`) extracts at most N items and leaves the rest `pending`. `--limit 0` reads but skips extraction (everything new waits as `pending`).
+- A normal `kb update` also picks up pending items. It exports pending Drive files again, so it extracts their latest text.
+
+**A small first run.** Before the full first run, check that everything works end to end with a handful of items:
+
+```bash
+kb update --dry-run --limit 5   # what would be sent, and the cost (a few cents)
+kb update --limit 5             # 5 items, sent directly (under llm.batch_min_requests), done in about a minute
+kb status                       # records, types, and the items still pending
+```
+
+Then look at the records in `_state/extracted.jsonl` (also in `data/state/`). When they look right, run `kb update` (or `kb update --extract`) for the rest.
+
+`--full` finds edited and deleted Discord messages, and exports every Drive file again even if it wasn't modified. Use it after a change to how files are exported, so the change reaches every file. Files whose text comes out the same are still skipped, so they aren't extracted again. Edited messages are extracted again.
+
+`kb rebuild` extracts every item again, keeping citation IDs. It costs about as much as the first run, so it asks first; `kb rebuild --dry-run` shows the estimate.
+
+`kb requeue` does only the first part of a rebuild: it marks every item as not extracted yet, and nothing else (no reads, no LLM calls). The following `kb update` runs then extract everything again, so you can check a sample with the new prompt before paying for the rest:
+
+```bash
+kb requeue
+kb update --pull --source discord          # re-read Discord and save its messages; Drive isn't exported
+kb update --extract --dry-run --limit 10   # cost of a 10-item sample
+kb update --extract --limit 10             # the sample: Discord from saved messages, Drive from raw/drive/
+kb update --extract                        # the rest
+```
+
+Each item keeps its old records until its new ones replace them, so for a while some records come from the old prompt (`prompt_version` on each record says which).
+
+The Discord pull is needed because only a hash of each message is kept once it's extracted, so `kb update --extract` has nothing to re-extract a Discord item from until Discord is read again. Drive files don't need it: their text is in `raw/drive/`. A plain `kb update --limit 10` works too, but it exports every Drive file again first, since they all count as not extracted.
+
+`--source discord` or `--source drive` limits any `kb update` to one source: only that source is read, and only its items are extracted. A Discord-only run doesn't move the "last run started" time that Drive's "modified since the last run" check uses, so Drive edits made in the meantime are still picked up by the next run that reads Drive.
 
 **If a run fails,** nothing in `_state/` changes and the next run starts from the same place. If a run is killed hard (e.g. the laptop closes), its lock stays behind; after `state.lock_timeout_minutes` (default 60) it counts as stale and `kb update --force-unlock` clears it.

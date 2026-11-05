@@ -3,13 +3,14 @@
 Each source folder is read recursively: files in its subfolders count too.
 
 Exporters (each returns markdown):
-- Docs   → Drive's built-in markdown export
+- Docs   → Drive's built-in markdown export, with embedded images replaced by `[image]`
 - Slides → text on every slide plus its speaker notes (Slides API)
 - Sheets → every grid tab as a markdown table (Sheets API)
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -149,6 +150,45 @@ def get_file(drive: Any, file_id: str, fields: str = FILE_FIELDS) -> dict[str, A
 # ---------------------------------------------------------------------------
 
 
+# Drive's markdown export embeds each image as base64: `![][image1]` in the text and a
+# `[image1]: <data:image/png;base64,...>` definition at the end. Images were about 90% of
+# all exported text, the model doesn't read them, and the original Doc (which citations
+# link to) still has them.
+_DATA_DEF = re.compile(
+    r"^[ \t]*\[([^\]\n]+)\]:[ \t]*<?data:[^\s>]*>?"
+    r"(?:[ \t]+(?:\"[^\"\n]*\"|'[^'\n]*'|\([^)\n]*\)))?"  # optional title
+    r"[ \t]*(?:\n|$)",
+    re.M,
+)
+_INLINE_DATA_IMAGE = re.compile(r"!\[([^\]\n]*)\]\(<?data:[^)\s]*>?\)")
+_RUN_OF_IMAGES = re.compile(r"\[image\](?:[ \t]*\[image\])+")
+
+
+def _placeholder(alt: str) -> str:
+    alt = alt.strip()
+    return f"[image: {alt}]" if alt else "[image]"
+
+
+def strip_embedded_images(md: str) -> str:
+    """Replace base64-embedded images with `[image]` (or `[image: alt text]`).
+
+    Done before the text is saved or hashed, so replacing a picture in a Doc doesn't
+    change its content hash. A run of images with nothing between them becomes a single
+    `[image]`. Images linked by URL are left alone.
+    """
+    labels = {m.group(1).lower() for m in _DATA_DEF.finditer(md)}
+    md = _DATA_DEF.sub("", md)
+    if labels:
+
+        def ref(m: re.Match[str]) -> str:
+            label = (m.group(2) or m.group(1)).lower()
+            return _placeholder(m.group(1)) if label in labels else m.group(0)
+
+        md = re.sub(r"!\[([^\]\n]*)\]\[([^\]\n]*)\]", ref, md)
+    md = _INLINE_DATA_IMAGE.sub(lambda m: _placeholder(m.group(1)), md)
+    return _RUN_OF_IMAGES.sub("[image]", md)
+
+
 def export_doc(drive: Any, file_id: str) -> str:
     data = (
         drive.files()
@@ -156,7 +196,7 @@ def export_doc(drive: Any, file_id: str) -> str:
         .execute(num_retries=NUM_RETRIES)
     )
     text = data.decode("utf-8") if isinstance(data, bytes) else str(data)
-    return text.strip() + "\n"
+    return strip_embedded_images(text).strip() + "\n"
 
 
 # ---------------------------------------------------------------------------
