@@ -39,7 +39,7 @@ from kb.config import REPO_ROOT, Config
 
 Log = Callable[[str], None]
 
-PROMPT_VERSION = 1
+PROMPT_VERSION = 2
 PROMPTS_DIR = REPO_ROOT / "prompts"
 
 CHUNK_TOKENS = 60_000  # allowed large files are split into parts of about this size

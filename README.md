@@ -273,7 +273,7 @@ A run saves the new content locally (`data/raw/discord/YYYY-MM-DD.json`, `data/r
 
 #### Extraction
 
-Each new or changed item (a Discord thread or channel message, or a Drive file) is sent to `llm.extract_model` with the prompt in `prompts/extract_v1.md`. The model returns **records**, saved in `_state/extracted.jsonl`:
+Each new or changed item (a Discord thread or channel message, or a Drive file) is sent to `llm.extract_model` with the prompt in `prompts/extract_v2.md`. The model returns **records**, saved in `_state/extracted.jsonl`:
 
 - `feedback`: an opinion, complaint, request, question, or praise, with a category, sentiment, and programming type (or none);
 - `program_info`: a `description` or `history` fact about a programming type.

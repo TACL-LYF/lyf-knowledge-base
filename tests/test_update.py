@@ -594,7 +594,7 @@ def test_first_run_extracts_records_with_citations(world):
     assert all(r["session"] is None for r in records)
     assert json.loads(world.kb.subfolder(st.STATE_FOLDER).read(st.SESSIONS)) == []
     m = world.state()["manifest"]
-    assert all(e["prompt_version"] == 1 for e in m.values())
+    assert all(e["prompt_version"] == upd.ext.PROMPT_VERSION for e in m.values())
 
 
 def test_second_run_makes_no_llm_calls(world):

@@ -338,7 +338,9 @@ def test_request_id_is_stable_and_batch_safe():
 
 
 def test_prompt_file_exists_for_the_current_version():
-    assert "programming" in ext.system_prompt()
+    prompt = ext.system_prompt()
+    assert "programming" in prompt
+    assert "Programming type or theme?" in prompt
 
 
 def test_session_is_kept_only_for_per_session_types():
